@@ -50,6 +50,7 @@ export default {
         return toolReverseIp((p.startsWith("/reverse-ip/") ? decodeURIComponent(p.slice(12)) : (url.searchParams.get("domain") || "")).trim().toLowerCase(), env);
       if (p === "/whois" || p.startsWith("/whois/"))     return toolWhois(toolDomain(url, p, "/whois"));
       if (p === "/tech" || p.startsWith("/tech/"))       return toolTech(toolDomain(url, p, "/tech"));
+      if (p === "/speed" || p.startsWith("/speed/"))     return toolSpeed(toolDomain(url, p, "/speed"), request, env);
       if (p === "/methodology")  return pageMethodology();
       if (p === "/about")        return pageAbout();
       if (p === "/guides")       return pageGuidesIndex();
@@ -1113,6 +1114,7 @@ const TOOLS = [
   ["/reverse-ip", "🔁", "Reverse IP", "Other sites seen on the same IP."],
   ["/whois", "🗓️", "WHOIS & age", "Domain age, registrar, expiry."],
   ["/tech", "🔎", "Tech stack", "CMS, framework, server, analytics."],
+  ["/speed", "⚡", "Speed test", "Time to first byte + a performance grade."],
   ["/check", "🛡️", "Hosting report", "Who really hosts it — the full investigation."],
 ];
 
@@ -1518,6 +1520,58 @@ async function toolTech(domain) {
     faq: `<h2>How it works</h2><p>HostCop fingerprints the technologies from the page's HTML and HTTP headers — the same signatures tools like Wappalyzer use. Detection is best-effort: sites can hide or proxy these signals, so a blank result doesn't always mean nothing's there.</p>` });
 }
 
+async function ttfb(url) {
+  const t0 = Date.now();
+  try {
+    await fetch(url, { redirect: "manual", cf: { cacheTtl: 0 }, signal: AbortSignal.timeout(8000), headers: { "user-agent": BROWSER_UA } });
+    return Date.now() - t0;
+  } catch { return null; }
+}
+
+async function toolSpeed(domain, request, env) {
+  let result = "";
+  if (domain) {
+    const res = await runCheck(domain, request.cf?.colo || "tool", env);
+    if (!res || res.noDns) result = `<div class="verdict down"><b>${esc(domain)}</b> — nothing to time; it didn't resolve. 🔴</div>${crossLink(domain)}`;
+    else if (!res.up) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond, so there's no speed to measure. 🔴</div>${crossLink(domain)}`;
+    else {
+      const url = res.finalUrl;
+      const samples = [res.ms, await ttfb(url), await ttfb(url)].filter(x => x != null).sort((a, b) => a - b);
+      const median = samples[Math.floor(samples.length / 2)];
+      const best = samples[0];
+      const [grade, label, cls] = median < 200 ? ["A", "fast", "ok"] : median < 500 ? ["B", "good", "ok"]
+        : median < 1000 ? ["C", "average", "warn"] : median < 2000 ? ["D", "slow", "warn"] : ["F", "very slow", "down"];
+      const emoji = cls === "ok" ? "✅" : cls === "warn" ? "⚠️" : "🔴";
+      const pctRow = await env.DB.prepare(
+        "SELECT ROUND(100.0*AVG(CASE WHEN response_ms > ? THEN 1 ELSE 0 END)) p FROM checks WHERE up=1").bind(median).first();
+      const pct = pctRow?.p;
+      const region = res.finalUrl ? (request.cf?.colo || "edge") : "edge";
+      result = `<div class="verdict ${cls}"><b>${esc(domain)}</b> responded in <b>${median} ms</b> — ${label} (grade ${grade}).${pct != null && pct >= 40 ? ` Faster than ${pct}% of sites we've checked.` : ""} ${emoji}</div>
+        <div class="stats">
+          <div><b>${grade}</b><span>grade</span></div>
+          <div><b>${median} ms</b><span>median TTFB</span></div>
+          <div><b>${best} ms</b><span>fastest</span></div>
+          <div><b>${samples.length}</b><span>samples</span></div>
+        </div>
+        <div class="card">
+          <div class="row"><span>Samples</span><b>${samples.join(" · ")} ms</b></div>
+          <div class="row"><span>Tested from</span><b>${esc(region)} · Cloudflare edge</b></div>
+          <div class="row"><span>Hosted by</span><b><a href="/host/${encodeURIComponent(res.brand)}">${esc(res.brand)}</a></b></div>
+          <div class="row"><span>Final URL</span><b>${esc(shortUrl(url))}</b></div>
+        </div>
+        <p class="muted small">Time to first byte, measured from a single Cloudflare edge location closest to the check. Multi-region timing is on the roadmap.</p>
+        ${crossLink(domain)}`;
+    }
+  }
+  return toolShell({
+    title: domain ? `${domain} speed test — TTFB & grade · HostCop` : "Website speed test — TTFB · HostCop",
+    desc: domain ? `How fast is ${domain}? Time to first byte, a performance grade, and how it compares.` : "Test any website's response time (TTFB) and get a simple performance grade.",
+    path: domain ? "/speed/" + domain : "/speed", base: "/speed", domain, result,
+    h1: domain ? `${esc(domain)} speed test` : "Website speed test",
+    intro: "How fast does a site respond? We measure its time to first byte and grade it — with how it stacks up against every site we've checked.",
+    faq: `<h2>What is TTFB?</h2><p>Time to first byte is how long the server takes to start responding — the truest measure of backend and hosting speed, before any images or scripts load. Under 200 ms is excellent; over a second usually points to a slow host or heavy backend.</p>` });
+}
+
 // ========================================================================
 // ROUTES: content pages
 // ========================================================================
@@ -1796,7 +1850,7 @@ function robots() {
 
 async function sitemap(env) {
   const staticUrls = ["/", "/hosts", "/compare", "/monitor", "/bulk", "/api",
-    "/tools", "/down", "/ssl", "/dns", "/redirect", "/dns-propagation", "/email", "/headers", "/reverse-ip", "/whois", "/tech",
+    "/tools", "/down", "/ssl", "/dns", "/redirect", "/dns-propagation", "/email", "/headers", "/reverse-ip", "/whois", "/tech", "/speed",
     "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
     ...Object.keys(GUIDES).map(s => "/guides/" + s)];
   let providerUrls = [], compareUrls = [];
