@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS checks (
   domain       TEXT NOT NULL,
   ip           TEXT,
   asn          TEXT,
-  provider     TEXT,          -- cleaned org name, e.g. CLOUDFLARENET
+  provider     TEXT,          -- raw ASN org, e.g. "CLOUDFLARENET - Cloudflare, Inc."
+  brand        TEXT,          -- clean display/grouping name, e.g. "Cloudflare"
   country      TEXT,          -- ISO country of the IP's network (approx location)
   response_ms  INTEGER,
   http_status  INTEGER,

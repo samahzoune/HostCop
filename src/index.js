@@ -67,15 +67,16 @@ async function runCheck(domain, region, env) {
   const ip = await resolveA(domain);
   const asnInfo = ip ? await ipToAsn(ip) : null;
   const provider = asnInfo ? asnInfo.name : "Unknown";
+  const brand = cleanProvider(provider);
   const country = asnInfo?.country ?? null;
   const [perf, ssl] = await Promise.all([measure(domain), getSslExpiry(domain)]);
   const sslExpiry = ssl?.expiry ?? null;
   const now = Date.now();
 
   await env.DB.prepare(
-    `INSERT INTO checks (domain, ip, asn, provider, country, response_ms, http_status, up, ssl_expiry, region, checked_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(domain, ip, asnInfo?.asn ?? null, provider, country,
+    `INSERT INTO checks (domain, ip, asn, provider, brand, country, response_ms, http_status, up, ssl_expiry, region, checked_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(domain, ip, asnInfo?.asn ?? null, provider, brand, country,
          perf.ms, perf.status, perf.up ? 1 : 0, sslExpiry, region, now).run();
 
   await env.DB.prepare(
@@ -84,7 +85,7 @@ async function runCheck(domain, region, env) {
      ON CONFLICT(domain) DO UPDATE SET provider=excluded.provider, last_checked=excluded.last_checked`
   ).bind(domain, provider, now, now).run();
 
-  return { domain, ip, provider, country, asn: asnInfo?.asn ?? null, sslExpiry, sslIssuer: ssl?.issuer ?? null, ...perf };
+  return { domain, ip, provider, brand, country, asn: asnInfo?.asn ?? null, sslExpiry, sslIssuer: ssl?.issuer ?? null, ...perf };
 }
 
 // Resolve A record via Cloudflare DNS-over-HTTPS (no key needed)
@@ -241,6 +242,36 @@ const INFRA_NAMES = ["AMAZON", "AWS", "GOOGLE", "MICROSOFT", "AZURE", "HETZNER",
   "LEASEWEB", "CONTABO", "ORACLE", "SCALEWAY", "ONLINE-NET", "DATACAMP", "PACKET"];
 const isInfra = name => { const u = (name || "").toUpperCase(); return INFRA_NAMES.some(c => u.includes(c)); };
 
+// Ranking thresholds — a host must clear these to be ranked (kills n=1 rankings).
+const RANK_MIN_SITES = 3;
+const RANK_MIN_CHECKS = 10;
+
+// Raw ASN org -> clean brand name. Ordered specific-before-generic.
+const BRANDS = [
+  ["CLOUDFLARE", "Cloudflare"], ["AKAMAI", "Akamai"], ["FASTLY", "Fastly"],
+  ["CLOUDFRONT", "Amazon CloudFront"], ["GOOGLE-CLOUD", "Google Cloud"], ["GOOGLE", "Google"],
+  ["AMAZON", "Amazon AWS"], ["AWS", "Amazon AWS"], ["AZURE", "Microsoft Azure"], ["MICROSOFT", "Microsoft"],
+  ["FACEBOOK", "Meta"], ["META-", "Meta"], ["DIGITALOCEAN", "DigitalOcean"], ["HETZNER", "Hetzner"],
+  ["OVH", "OVHcloud"], ["LINODE", "Linode"], ["VULTR", "Vultr"], ["GODADDY", "GoDaddy"],
+  ["HOSTINGER", "Hostinger"], ["SITEGROUND", "SiteGround"], ["BLUEHOST", "Bluehost"],
+  ["UNIFIEDLAYER", "Bluehost"], ["HOSTGATOR", "HostGator"], ["NAMECHEAP", "Namecheap"],
+  ["SOFTLAYER", "IBM Cloud"], ["IBM", "IBM Cloud"], ["INTERNAP", "Internap"], ["LEASEWEB", "Leaseweb"],
+  ["CONTABO", "Contabo"], ["SCALEWAY", "Scaleway"], ["AUTOMATTIC", "Automattic"], ["GITHUB", "GitHub"],
+  ["SHOPIFY", "Shopify"], ["ORACLE", "Oracle Cloud"], ["ALIBABA", "Alibaba Cloud"], ["TENCENT", "Tencent Cloud"],
+  ["DREAMHOST", "DreamHost"], ["A2HOSTING", "A2 Hosting"], ["A2-", "A2 Hosting"], ["GCORE", "Gcore"],
+  ["G-CORE", "Gcore"], ["NETLIFY", "Netlify"], ["VERCEL", "Vercel"], ["WPENGINE", "WP Engine"],
+  ["WP-ENGINE", "WP Engine"], ["KINSTA", "Kinsta"], ["INMOTION", "InMotion"], ["LIQUIDWEB", "Liquid Web"],
+  ["RACKSPACE", "Rackspace"], ["IONOS", "IONOS"], ["1AND1", "IONOS"],
+];
+function cleanProvider(raw) {
+  if (!raw || raw === "Unknown") return "Unknown";
+  const u = raw.toUpperCase();
+  for (const [k, v] of BRANDS) if (u.includes(k)) return v;
+  let s = raw.includes(" - ") ? raw.split(" - ").slice(1).join(" - ") : raw;
+  s = s.replace(/,\s*[A-Z]{2}$/, "").replace(/[.,]?\s*(Inc|LLC|Ltd|Corp|Corporation|Co|GmbH|S\.?A|B\.?V|AB|Pty)\.?$/i, "").trim();
+  return s || raw;
+}
+
 // Minimal TLS 1.2 ClientHello with SNI; we omit supported_versions so a TLS 1.3
 // server falls back to 1.2 and sends its Certificate in the clear.
 function buildClientHello(host) {
@@ -329,18 +360,32 @@ const withTimeout = (promise, ms) => Promise.race([
   new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), Math.max(0, ms))),
 ]);
 
+// A server is "up" if it responds with ANY HTTP status — 200, 301, even a 403
+// bot-block means the server is alive. Only a connection failure/timeout counts
+// as down, and we retry once first to avoid flagging a transient blip as an outage.
 async function measure(domain) {
-  const t0 = Date.now();
-  let status = 0, up = false, server = null;
-  try {
-    const r = await fetch(`https://${domain}/`, { redirect: "manual", cf: { cacheTtl: 0 } });
-    status = r.status; up = true;
-    server = r.headers.get("server");
-    // From inside a Worker, Cloudflare's egress reports "cloudflare" regardless of
-    // the true origin — unreliable, so drop it and keep only revealing values.
+  const attempt = async () => {
+    const t0 = Date.now();
+    const r = await fetch(`https://${domain}/`, {
+      redirect: "manual",
+      cf: { cacheTtl: 0 },
+      signal: AbortSignal.timeout(8000),
+      headers: {
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+        "accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+      },
+    });
+    let server = r.headers.get("server");
+    // Worker egress reports "cloudflare" regardless of true origin — unreliable.
     if (server && server.toLowerCase() === "cloudflare") server = null;
-  } catch (_) {}
-  return { ms: Date.now() - t0, status, up, server };
+    return { ms: Date.now() - t0, status: r.status, up: true, server };
+  };
+  try { return await attempt(); }
+  catch {
+    try { return await attempt(); }                 // one retry before declaring down
+    catch { return { ms: 0, status: 0, up: false, server: null }; }
+  }
 }
 
 // CDN / edge-network detection: if the A record points here, the true origin is masked.
@@ -364,8 +409,8 @@ async function apiCheck(url, request, env) {
   ]);
   return json({
     domain: res.domain, ip: res.ip, asn: res.asn ? "AS" + res.asn : null,
-    provider: res.provider, country: res.country, cdn: isCdn(res.provider),
-    origin_provider: oi.origin?.provider ?? null, origin_ip: oi.origin?.ip ?? null,
+    host: res.brand, provider: res.provider, country: res.country, cdn: isCdn(res.brand),
+    origin_provider: oi.origin ? cleanProvider(oi.origin.provider) : null, origin_ip: oi.origin?.ip ?? null,
     origin_found_via: oi.origin?.method ?? null,
     reseller: !!(oi.origin && isInfra(oi.origin.provider)),
     email_host: oi.mailHost, dns_host: oi.dnsHost,
@@ -410,16 +455,17 @@ async function handleCheck(domain, request, env) {
   let resellerNote = "";
   if (oi.cdn) {
     if (oi.origin) {
+      const ob = cleanProvider(oi.origin.provider);
       invRows += `<div class="row"><span>Real origin (likely)</span>
-           <b><a href="/host/${encodeURIComponent(oi.origin.provider)}">${esc(oi.origin.provider)}</a>${oi.origin.ip ? " · " + esc(oi.origin.ip) : ""}</b></div>
+           <b><a href="/host/${encodeURIComponent(ob)}">${esc(ob)}</a>${oi.origin.ip ? " · " + esc(oi.origin.ip) : ""}</b></div>
          <div class="row"><span>Found via</span><b>${esc(oi.origin.method)}</b></div>`;
       if (isInfra(oi.origin.provider))
-        resellerNote = `<p class="note">🔎 <b>Reseller / white-label:</b> the real machine runs on <b>${esc(oi.origin.provider)}</b> (wholesale infrastructure). The brand on the invoice is likely reselling it.</p>`;
+        resellerNote = `<p class="note">🔎 <b>Reseller / white-label:</b> the real machine runs on <b>${esc(ob)}</b> (wholesale infrastructure). The brand on the invoice is likely reselling it.</p>`;
     } else {
       invRows += `<div class="row"><span>Real origin</span><b class="muted">not exposed via public signals — well shielded</b></div>`;
     }
   }
-  if (oi.mailHost) invRows += `<div class="row"><span>Email host</span><b>${esc(oi.mailHost)}${oi.mailProvider ? " · " + esc(oi.mailProvider) : ""}</b></div>`;
+  if (oi.mailHost) invRows += `<div class="row"><span>Email host</span><b>${esc(oi.mailHost)}${oi.mailProvider ? " · " + esc(cleanProvider(oi.mailProvider)) : ""}</b></div>`;
   if (oi.dnsHost) invRows += `<div class="row"><span>DNS host</span><b>${esc(oi.dnsHost)}</b></div>`;
   if (rdns) invRows += `<div class="row"><span>Reverse DNS</span><b>${esc(rdns)}</b></div>`;
   if (res.server) invRows += `<div class="row"><span>Server</span><b>${esc(res.server)}</b></div>`;
@@ -430,8 +476,8 @@ async function handleCheck(domain, request, env) {
        ${oi.cdn ? `<p class="muted small">Origin found by probing records a CDN doesn't proxy (mail, common subdomains). A blank means the origin is genuinely well hidden.</p>` : ""}`
     : "";
 
-  const cdnNote = isCdn(res.provider)
-    ? `<p class="note">⚡ This domain sits behind <b>${esc(res.provider)}</b>, a CDN / edge network — so "Hosted by" is the CDN, not the real server. We dug for the true origin below.</p>`
+  const cdnNote = isCdn(res.brand)
+    ? `<p class="note">⚡ This domain sits behind <b>${esc(res.brand)}</b>, a CDN / edge network — so "Hosted by" is the CDN, not the real server. We dug for the true origin below.</p>`
     : "";
 
   const loc = res.country ? `${flag(res.country)} ${esc(res.country)}` : "—";
@@ -449,8 +495,8 @@ async function handleCheck(domain, request, env) {
     ${cdnNote}
     <div class="card">
       <div class="row"><span>Hosted by</span>
-        <a href="/host/${encodeURIComponent(res.provider)}"><b>${esc(res.provider)}</b></a></div>
-      <div class="row"><span>Type</span><b>${isCdn(res.provider) ? "CDN / edge network" : "Origin host"}</b></div>
+        <a href="/host/${encodeURIComponent(res.brand)}"><b>${esc(res.brand)}</b></a></div>
+      <div class="row"><span>Type</span><b>${isCdn(res.brand) ? "CDN / edge network" : "Origin host"}</b></div>
       <div class="row"><span>IP address</span><b>${esc(res.ip || "—")}</b></div>
       <div class="row"><span>ASN</span><b>${res.asn ? "AS" + esc(res.asn) : "—"}</b></div>
       <div class="row"><span>Location (approx)</span><b>${loc}</b></div>
@@ -488,7 +534,7 @@ async function handleProvider(provider, env) {
             ROUND(100.0*SUM(up)/COUNT(*),1) uptime,
             MAX(checked_at) last_seen,
             MAX(country) country
-     FROM checks WHERE provider = ?`
+     FROM checks WHERE brand = ?`
   ).bind(provider).all();
   const s = results[0];
   if (!s || !s.checks)
@@ -499,7 +545,7 @@ async function handleProvider(provider, env) {
   const recent = await env.DB.prepare(
     `SELECT domain, MAX(checked_at) t, ROUND(AVG(response_ms)) ms,
             ROUND(100.0*SUM(up)/COUNT(*)) up
-     FROM checks WHERE provider = ? GROUP BY domain ORDER BY t DESC LIMIT 12`
+     FROM checks WHERE brand = ? GROUP BY domain ORDER BY t DESC LIMIT 12`
   ).bind(provider).all();
 
   const rows = recent.results.map(d => `
@@ -538,24 +584,40 @@ async function handleLeaderboard(url, env) {
     : "uptime DESC, avg_ms ASC";
 
   const { results } = await env.DB.prepare(
-    `SELECT provider, COUNT(DISTINCT domain) sites,
+    `SELECT brand, COUNT(DISTINCT domain) sites,
             ROUND(AVG(response_ms)) avg_ms,
             ROUND(100.0*SUM(up)/COUNT(*),1) uptime,
-            MAX(checked_at) last_seen
-     FROM checks WHERE provider != 'Unknown'
-     GROUP BY provider HAVING COUNT(*) >= 3
+            COUNT(*) checks, MAX(checked_at) last_seen
+     FROM checks WHERE brand IS NOT NULL AND brand != 'Unknown'
+     GROUP BY brand
+     HAVING COUNT(DISTINCT domain) >= ${RANK_MIN_SITES} AND COUNT(*) >= ${RANK_MIN_CHECKS}
      ORDER BY ${order} LIMIT 100`
   ).all();
 
-  const rows = results.map((r, i) => `
+  const hosts = results.filter(r => !isCdn(r.brand));
+  const cdns = results.filter(r => isCdn(r.brand));
+
+  const rowsOf = list => list.map((r, i) => `
     <tr>
       <td>${i + 1}</td>
-      <td><a href="/host/${encodeURIComponent(r.provider)}">${esc(r.provider)}</a>${isCdn(r.provider) ? ' <span class="tag">CDN</span>' : ""}</td>
+      <td><a href="/host/${encodeURIComponent(r.brand)}">${esc(r.brand)}</a></td>
       <td>${r.uptime}%</td>
       <td>${r.avg_ms} ms</td>
       <td>${r.sites}</td>
+      <td>${r.checks}</td>
       <td class="muted">${timeAgo(r.last_seen)}</td>
-    </tr>`).join("") || `<tr><td colspan="6">No hosts ranked yet — <a href="/">check a domain</a> to seed the data.</td></tr>`;
+    </tr>`).join("");
+  const table = (list, empty) => list.length
+    ? `<table><tr><th>#</th><th>Host</th><th>Uptime</th><th>Avg</th><th>Sites</th><th>Checks</th><th>Updated</th></tr>${rowsOf(list)}</table>`
+    : `<p class="muted">${empty}</p>`;
+
+  // Hosts that don't yet clear the bar — shown honestly, not ranked.
+  const { results: emerging } = await env.DB.prepare(
+    `SELECT brand, COUNT(*) checks FROM checks WHERE brand IS NOT NULL AND brand != 'Unknown'
+     GROUP BY brand
+     HAVING NOT (COUNT(DISTINCT domain) >= ${RANK_MIN_SITES} AND COUNT(*) >= ${RANK_MIN_CHECKS})
+     ORDER BY checks DESC LIMIT 40`
+  ).all();
 
   const tab = (key, label) => `<a class="pill ${sort === key ? "on" : ""}" href="/hosts?sort=${key}">${label}</a>`;
 
@@ -566,13 +628,16 @@ async function handleLeaderboard(url, env) {
     body: `
     <h1>Host rankings</h1>
     <div class="trustbadge">🛡 No affiliate links · No paid placements · Just measured data</div>
-    <p class="muted">Ranked from live measured data — real uptime and response time, crowdsourced from every domain checked. Minimum 3 checks to appear.</p>
+    <p class="muted">Ranked from live measurements. To qualify, a host needs at least <b>${RANK_MIN_SITES} distinct sites</b> and <b>${RANK_MIN_CHECKS} checks</b> — so no host is ranked on a single sample.</p>
     <div class="pills">${tab("uptime", "Most reliable")}${tab("speed", "Fastest")}${tab("tested", "Most tested")}</div>
-    <p class="muted small">Want two head-to-head? <a href="/compare">Compare any two hosts →</a></p>
-    <table>
-      <tr><th>#</th><th>Host</th><th>Uptime</th><th>Avg</th><th>Sites</th><th>Updated</th></tr>
-      ${rows}
-    </table>
+    <p class="muted small">Two head-to-head? <a href="/compare">Compare any two hosts →</a></p>
+    ${table(hosts, "Not enough qualifying hosts yet — check more domains to build the rankings.")}
+    <h2>CDN &amp; edge networks</h2>
+    <p class="muted small">Measured separately: a CDN's "uptime" reflects its edge answering, and many return a 403 to automated checks (still counted as up, since the server responded).</p>
+    ${table(cdns, "No CDNs qualify yet.")}
+    ${emerging.length ? `<h2>Building data</h2>
+      <p class="muted small">Seen, but not enough measurements to rank fairly yet (checks in brackets):</p>
+      <p class="muted small">${emerging.map(e => esc(e.brand) + " (" + e.checks + ")").join(" · ")}</p>` : ""}
     <p class="muted">The numbers here <i>are</i> the ranking — nothing hidden. See <a href="/methodology">methodology</a>.</p>
   ` }));
 }
@@ -582,9 +647,9 @@ async function handleBadge(domain, env) {
   let provider = "not checked";
   if (domain) {
     const row = await env.DB.prepare(
-      "SELECT provider FROM checks WHERE domain = ? ORDER BY checked_at DESC LIMIT 1"
+      "SELECT brand FROM checks WHERE domain = ? ORDER BY checked_at DESC LIMIT 1"
     ).bind(domain).first();
-    if (row?.provider) provider = row.provider;
+    if (row?.brand) provider = row.brand;
   }
   const left = "verified by HostCop";
   const right = provider;
@@ -608,20 +673,20 @@ async function handleBadge(domain, env) {
 
 // ---- compare + bulk + API docs ------------------------------------------
 
-async function providerStats(env, provider) {
+async function providerStats(env, brand) {
   const r = await env.DB.prepare(
     `SELECT COUNT(*) checks, COUNT(DISTINCT domain) sites,
             ROUND(AVG(response_ms)) avg_ms,
             ROUND(100.0*SUM(up)/COUNT(*),1) uptime
-     FROM checks WHERE provider = ?`).bind(provider).first();
+     FROM checks WHERE brand = ?`).bind(brand).first();
   return r && r.checks ? r : null;
 }
 
 async function topProviders(env, n) {
   const { results } = await env.DB.prepare(
-    `SELECT provider FROM checks WHERE provider!='Unknown'
-     GROUP BY provider HAVING COUNT(*)>=3 ORDER BY COUNT(*) DESC LIMIT ?`).bind(n).all();
-  return results.map(r => r.provider);
+    `SELECT brand FROM checks WHERE brand IS NOT NULL AND brand!='Unknown'
+     GROUP BY brand HAVING COUNT(*)>=3 ORDER BY COUNT(*) DESC LIMIT ?`).bind(n).all();
+  return results.map(r => r.brand);
 }
 
 const provSlug = s => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -750,9 +815,35 @@ function pageApi() {
 // ROUTES: content pages
 // ========================================================================
 
-function handleHome(env) {
+async function handleHome(env) {
+  // Live figures + a real top-hosts preview, pulled straight from the database.
+  let statLine = "", livePreview = "";
+  try {
+    const s = await env.DB.prepare(
+      "SELECT COUNT(*) checks, COUNT(DISTINCT domain) domains, COUNT(DISTINCT brand) hosts FROM checks WHERE brand!='Unknown'"
+    ).first();
+    if (s && s.checks) statLine = `<div class="statline"><b>${s.checks.toLocaleString()}</b> checks · <b>${s.domains.toLocaleString()}</b> domains · <b>${s.hosts}</b> hosts measured — and counting.</div>`;
+    const { results } = await env.DB.prepare(
+      `SELECT brand, ROUND(AVG(response_ms)) ms, ROUND(100.0*SUM(up)/COUNT(*),1) up
+       FROM checks WHERE brand IS NOT NULL AND brand!='Unknown'
+       GROUP BY brand HAVING COUNT(DISTINCT domain) >= ${RANK_MIN_SITES} AND COUNT(*) >= ${RANK_MIN_CHECKS}
+       ORDER BY up DESC, ms ASC LIMIT 5`
+    ).all();
+    if (results.length) livePreview = `
+      <section>
+        <div class="kicker">Live from the database</div>
+        <h2>Most reliable hosts right now</h2>
+        <div class="card">${results.map((r, i) =>
+          `<div class="row"><span>${i + 1}. <a href="/host/${encodeURIComponent(r.brand)}">${esc(r.brand)}</a></span><b>${r.up}% · ${r.ms} ms</b></div>`).join("")}</div>
+        <p class="muted small">Ranked by measured uptime, then speed. <a href="/hosts">See the full rankings →</a></p>
+      </section>`;
+  } catch {}
+
   const body = `
     ${heroSection()}
+    <div class="trustbadge center">🛡 No affiliate links · No paid placements · Just measured data</div>
+    ${statLine}
+    ${livePreview}
 
     <section class="how">
       <div class="kicker">3 steps</div>
@@ -1066,7 +1157,7 @@ function layout({ title, desc, path, body, home }) {
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
 <style>${CSS}</style>
 </head><body>
-<div id="overlay"><div class="spin"></div><p id="ovmsg">Resolving DNS…</p></div>
+<div id="overlay"><div class="spin"></div><p id="ovmsg"></p></div>
 <header class="nav"><div class="nav-in">
   <a class="brand" href="/"><svg class="emblem" viewBox="0 0 24 24"><path class="s" d="M12 2 4 5v6c0 5 3.4 8 8 9 4.6-1 8-4 8-9V5l-8-3Z"/><path class="s2" d="M12 2 4 5v6c0 5 3.4 8 8 9V2Z"/><circle class="g" cx="11.2" cy="10.2" r="2.4"/><path class="g" d="m13.1 12.1 2 2.2" stroke-linecap="round"/></svg>Host<span>Cop</span></a>
   <nav>
@@ -1099,6 +1190,7 @@ function layout({ title, desc, path, body, home }) {
     if(ov){ov.style.display='flex';
       var msgs=['Resolving DNS…','Detecting the real host…','Measuring response time…','Reading SSL certificate…'];
       var i=0,m=document.getElementById('ovmsg');
+      if(m)m.textContent=msgs[0];
       setInterval(function(){i=(i+1)%msgs.length;if(m)m.textContent=msgs[i];},900);
     }
     location.assign('/check/'+encodeURIComponent(raw));
@@ -1206,6 +1298,9 @@ footer{max-width:980px;margin:56px auto 0;padding:30px 20px;border-top:1px solid
 .fcols a{display:block;color:var(--muted);font-size:.92rem;padding:2px 0}
 .fcols>div>b{font-family:'Space Grotesk',sans-serif;font-weight:700}
 .trustbadge{display:inline-block;background:var(--tag);color:var(--tagfg);border:1px solid var(--border);border-radius:999px;padding:7px 14px;font-family:'JetBrains Mono',monospace;font-size:.76rem;margin:2px 0 12px}
+.trustbadge.center{display:block;width:max-content;max-width:100%;margin:0 auto 10px;text-align:center}
+.statline{text-align:center;color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:.85rem;margin:2px 0 10px}
+.statline b{color:var(--brand)}
 textarea{width:100%;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:var(--surface);color:var(--fg);font-family:'JetBrains Mono',monospace;font-size:.9rem;resize:vertical}
 textarea:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px var(--glow)}
 select{padding:11px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--fg);font-size:.95rem;max-width:46%}
