@@ -64,20 +64,29 @@ async function runCheck(domain, region, env) {
   domain = cleanDomain(domain);
   if (!domain) return null;
 
-  const ip = await resolveA(domain);
-  const asnInfo = ip ? await ipToAsn(ip) : null;
-  const provider = asnInfo ? asnInfo.name : "Unknown";
+  const ips = await resolveAllA(domain);
+  if (!ips.length) return { domain, noDns: true };    // domain doesn't point anywhere
+
+  // Majority ASN across the A records; flag when they span multiple providers.
+  const distinctIps = [...new Set(ips)];
+  const asns = await Promise.all(distinctIps.slice(0, 4).map(ip => ipToAsn(ip).catch(() => null)));
+  const tally = {};
+  asns.forEach(a => { if (a) (tally[a.name] ||= { n: 0, asn: a.asn, country: a.country }).n++; });
+  let provider = "Unknown", asn = null, country = null, best = -1;
+  for (const [name, v] of Object.entries(tally)) if (v.n > best) { best = v.n; provider = name; asn = v.asn; country = v.country; }
+  const loadBalanced = Object.keys(tally).length > 1;
   const brand = cleanProvider(provider);
-  const country = asnInfo?.country ?? null;
-  const [perf, ssl] = await Promise.all([measure(domain), getSslExpiry(domain)]);
+  const ip = distinctIps[0];
+
+  const [pr, ssl] = await Promise.all([probe(domain), getSslExpiry(domain)]);
   const sslExpiry = ssl?.expiry ?? null;
   const now = Date.now();
 
   await env.DB.prepare(
     `INSERT INTO checks (domain, ip, asn, provider, brand, country, response_ms, http_status, up, ssl_expiry, region, checked_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(domain, ip, asnInfo?.asn ?? null, provider, brand, country,
-         perf.ms, perf.status, perf.up ? 1 : 0, sslExpiry, region, now).run();
+  ).bind(domain, ip, asn, provider, brand, country,
+         pr.ms, pr.finalStatus, pr.up ? 1 : 0, sslExpiry, region, now).run();
 
   await env.DB.prepare(
     `INSERT INTO domains (domain, provider, added_at, last_checked)
@@ -85,7 +94,8 @@ async function runCheck(domain, region, env) {
      ON CONFLICT(domain) DO UPDATE SET provider=excluded.provider, last_checked=excluded.last_checked`
   ).bind(domain, provider, now, now).run();
 
-  return { domain, ip, provider, brand, country, asn: asnInfo?.asn ?? null, sslExpiry, sslIssuer: ssl?.issuer ?? null, ...perf };
+  return { domain, ip, ips: distinctIps, provider, brand, country, asn, loadBalanced,
+           sslExpiry, sslIssuer: ssl?.issuer ?? null, ...pr };
 }
 
 // Resolve A record via Cloudflare DNS-over-HTTPS (no key needed)
@@ -94,6 +104,14 @@ async function resolveA(domain) {
     { headers: { accept: "application/dns-json" } });
   const j = await r.json();
   return (j.Answer || []).find(a => a.type === 1)?.data ?? null;
+}
+
+// All A records — used to detect load-balancing across providers.
+async function resolveAllA(domain) {
+  const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${domain}&type=A`,
+    { headers: { accept: "application/dns-json" } });
+  const j = await r.json();
+  return (j.Answer || []).filter(a => a.type === 1).map(a => a.data);
 }
 
 // IP -> ASN + org name + country via Team Cymru's free DNS service (over DoH)
@@ -272,6 +290,50 @@ function cleanProvider(raw) {
   return s || raw;
 }
 
+// Known domain-parking / for-sale networks.
+const PARKING = ["SEDO", "BODIS", "AFTERNIC", "PARKINGCREW", "ABOVE.COM", "HUGEDOMAINS",
+  "DAN.COM", "UNIREGISTRY", "PARKLOGIC", "SKENZO", "FASTPARK", "NAMEDRIVE", "PARK.IO"];
+function looksParked(res, oi) {
+  const hay = [res.provider, oi?.dnsHost, oi?.mailHost].filter(Boolean).join(" ").toUpperCase();
+  return PARKING.some(p => hay.includes(p));
+}
+
+const speedWord = ms => ms < 200 ? "fast response" : ms < 500 ? "average response"
+  : ms < 1000 ? "slow response" : "very slow response";
+
+function statusText(s) {
+  if (!s) return "no response";
+  if (s === 200) return "OK";
+  if ([301, 302, 303, 307, 308].includes(s)) return "redirect";
+  if (s === 403 || s === 429) return "up but blocking automated visitors (common for big sites)";
+  if (s === 404) return "homepage returns Not Found — possibly misconfigured";
+  if (s >= 500) return "server error — the site may be having problems";
+  if (s >= 400) return `client error (${s})`;
+  return String(s);
+}
+
+const shortUrl = u => (u || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
+
+// One-sentence verdict: speed judgment + worst-applicable health judgment.
+function buildVerdict(res, pctFaster) {
+  const loc = res.country ? `${flag(res.country)} ${esc(res.country)}` : null;
+  const days = res.sslExpiry != null ? Math.round((res.sslExpiry - Date.now()) / 86400000) : null;
+  const s = res.finalStatus;
+  let emoji = "✅", cls = "ok", health = "healthy setup";
+  if (days != null && days < 0) { emoji = "🔴"; cls = "down"; health = "its SSL certificate has expired"; }
+  else if (s >= 500) { emoji = "⚠️"; cls = "warn"; health = `the server is returning errors (${s})`; }
+  else if (res.loop) { emoji = "⚠️"; cls = "warn"; health = "it's stuck in a redirect loop"; }
+  else if (res.tooLong) { emoji = "⚠️"; cls = "warn"; health = "it has a very long redirect chain"; }
+  else if (days != null && days < 30) { emoji = "⚠️"; cls = "warn"; health = `its SSL certificate expires in ${days} days`; }
+  else if (s === 403 || s === 429) { emoji = "🟡"; cls = "note"; health = "it's up but blocking automated checks (likely fine for humans)"; }
+  else if (s === 404) { emoji = "🟡"; cls = "note"; health = "its homepage returns Not Found (404)"; }
+  else if (s >= 400) { emoji = "🟡"; cls = "note"; health = `its homepage returns ${s}`; }
+  else if (days != null && days < 60) { emoji = "🟡"; cls = "note"; health = `SSL renews in ${days} days`; }
+  const speed = speedWord(res.ms) +
+    (res.ms < 200 && pctFaster != null && pctFaster >= 40 ? ` (faster than ${pctFaster}% of sites we've checked)` : "");
+  return { line: `<b>${esc(res.domain)}</b> runs on <b>${esc(res.brand)}</b>${loc ? ` from ${loc}` : ""} — ${speed}, ${health}. ${emoji}`, cls };
+}
+
 // Minimal TLS 1.2 ClientHello with SNI; we omit supported_versions so a TLS 1.3
 // server falls back to 1.2 and sends its Certificate in the clear.
 function buildClientHello(host) {
@@ -360,32 +422,53 @@ const withTimeout = (promise, ms) => Promise.race([
   new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), Math.max(0, ms))),
 ]);
 
-// A server is "up" if it responds with ANY HTTP status — 200, 301, even a 403
-// bot-block means the server is alive. Only a connection failure/timeout counts
-// as down, and we retry once first to avoid flagging a transient blip as an outage.
-async function measure(domain) {
-  const attempt = async () => {
-    const t0 = Date.now();
-    const r = await fetch(`https://${domain}/`, {
-      redirect: "manual",
-      cf: { cacheTtl: 0 },
-      signal: AbortSignal.timeout(8000),
-      headers: {
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
-        "accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-      },
-    });
-    let server = r.headers.get("server");
-    // Worker egress reports "cloudflare" regardless of true origin — unreliable.
-    if (server && server.toLowerCase() === "cloudflare") server = null;
-    return { ms: Date.now() - t0, status: r.status, up: true, server };
-  };
-  try { return await attempt(); }
-  catch {
-    try { return await attempt(); }                 // one retry before declaring down
-    catch { return { ms: 0, status: 0, up: false, server: null }; }
+function fetchOnce(url) {
+  return fetch(url, {
+    redirect: "manual",
+    cf: { cacheTtl: 0 },
+    signal: AbortSignal.timeout(8000),
+    headers: {
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+      "accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    },
+  });
+}
+
+// Follow the redirect chain (max 5 hops) and time the FINAL destination — a fast
+// 301 tells you nothing about the real page. A server is "up" if it answers with
+// ANY status (200/301/even a 403 bot-block). Only a connection failure/timeout is
+// down, and the first hop retries once before we call it down.
+async function probe(domain) {
+  const chain = [], seen = new Set();
+  let url = `https://${domain}/`;
+  let up = false, ms = 0, finalStatus = 0, finalUrl = url, server = null, loop = false, tooLong = false;
+
+  for (let hop = 0; ; hop++) {
+    if (hop > 5) { tooLong = true; break; }
+    let r; const t0 = Date.now();
+    try { r = await fetchOnce(url); }
+    catch {
+      if (hop === 0) {
+        try { r = await fetchOnce(url); }             // one retry on the first hop
+        catch { return { up: false, ms: 0, finalStatus: 0, finalUrl: url, chain, loop: false, tooLong: false, server: null }; }
+      } else break;                                   // later hop failed — keep what we have
+    }
+    ms = Date.now() - t0;
+    up = true; finalStatus = r.status; finalUrl = url;
+    let sv = r.headers.get("server");
+    if (sv && sv.toLowerCase() === "cloudflare") sv = null;   // Worker egress lies; drop it
+    server = sv;
+    chain.push({ url, status: r.status });
+    const loc = r.headers.get("location");
+    if ([301, 302, 303, 307, 308].includes(r.status) && loc) {
+      let next; try { next = new URL(loc, url).toString(); } catch { break; }
+      if (seen.has(next)) { loop = true; break; }
+      seen.add(url); url = next; continue;
+    }
+    break;                                            // final (non-redirect) destination
   }
+  return { up, ms, finalStatus, finalUrl, chain, loop, tooLong, server };
 }
 
 // CDN / edge-network detection: if the A record points here, the true origin is masked.
@@ -403,19 +486,32 @@ async function apiCheck(url, request, env) {
   if (!domain) return json({ error: "invalid domain" }, 400);
   const res = await runCheck(domain, request.cf?.colo || "edge", env);
   if (!res) return json({ error: "lookup failed" }, 502);
+  if (res.noDns) return json({ domain: res.domain, resolves: false,
+    verdict: `${res.domain} doesn't point anywhere — no DNS records found.` });
+
   const [oi, rdns] = await Promise.all([
     discoverOrigin(res.domain, res.provider),
     res.ip ? reverseDns(res.ip) : Promise.resolve(null),
   ]);
+  const pctRow = res.up ? await env.DB.prepare(
+    "SELECT ROUND(100.0*AVG(CASE WHEN response_ms > ? THEN 1 ELSE 0 END)) p FROM checks WHERE up=1"
+  ).bind(res.ms).first() : null;
+  const parked = looksParked(res, oi);
+  const verdict = !res.up ? `${res.domain} appears to be down — the server didn't respond.`
+    : parked ? `${res.domain} is a parked domain — not hosting a real website.`
+    : buildVerdict(res, pctRow?.p ?? null).line.replace(/<\/?b>/g, "");
   return json({
-    domain: res.domain, ip: res.ip, asn: res.asn ? "AS" + res.asn : null,
+    domain: res.domain, verdict,
+    ip: res.ip, asn: res.asn ? "AS" + res.asn : null,
     host: res.brand, provider: res.provider, country: res.country, cdn: isCdn(res.brand),
+    load_balanced: res.loadBalanced, parked,
     origin_provider: oi.origin ? cleanProvider(oi.origin.provider) : null, origin_ip: oi.origin?.ip ?? null,
     origin_found_via: oi.origin?.method ?? null,
     reseller: !!(oi.origin && isInfra(oi.origin.provider)),
     email_host: oi.mailHost, dns_host: oi.dnsHost,
     reverse_dns: rdns, server: res.server,
-    up: res.up, response_ms: res.ms, http_status: res.status,
+    up: res.up, response_ms: res.ms, http_status: res.finalStatus, final_url: res.finalUrl,
+    redirects: res.chain, redirect_loop: res.loop || false,
     ssl_expiry: res.sslExpiry ? new Date(res.sslExpiry).toISOString() : null,
     ssl_issuer: res.sslIssuer ?? null,
   });
@@ -429,10 +525,18 @@ async function handleCheck(domain, request, env) {
   const res = await runCheck(domain, request.cf?.colo || "edge", env);
   if (!res) return html(layout({ title: `HostCop · ${domain}`, desc: "", path: "/check/" + domain,
     body: `<a class="back" href="/">← check another</a><h1>${esc(domain)}</h1>
-           <p class="muted">Couldn't read that domain — it may not resolve or may be offline.</p>` }));
+           <p class="muted">Couldn't read that domain — please try again.</p>` }));
+
+  if (res.noDns) return html(layout({
+    title: `${domain} — no DNS records · HostCop`,
+    desc: `${domain} has no DNS records — it doesn't point to a server.`,
+    path: "/check/" + domain,
+    body: `<a class="back" href="/">← check another</a><h1>${esc(domain)}</h1>
+      <div class="verdict down"><b>${esc(domain)}</b> doesn't point anywhere — no DNS records found. 🔴</div>
+      <p class="muted">There's no A record for this domain, so there's no server to measure. It may be unregistered, expired, or configured for other services only.</p>` }));
 
   const badge = res.up
-    ? `<span class="up">UP</span> · ${res.ms} ms · HTTP ${res.status}`
+    ? `<span class="up">UP</span> · ${res.ms} ms · HTTP ${res.finalStatus} <span class="muted">· ${esc(statusText(res.finalStatus))}</span>`
     : `<span class="down">DOWN</span> · no response`;
 
   let ssl = `<b>—</b>`;
@@ -469,6 +573,12 @@ async function handleCheck(domain, request, env) {
   if (oi.dnsHost) invRows += `<div class="row"><span>DNS host</span><b>${esc(oi.dnsHost)}</b></div>`;
   if (rdns) invRows += `<div class="row"><span>Reverse DNS</span><b>${esc(rdns)}</b></div>`;
   if (res.server) invRows += `<div class="row"><span>Server</span><b>${esc(res.server)}</b></div>`;
+  if (res.chain && res.chain.length > 1) {
+    const hops = res.chain.map(c => `${esc(shortUrl(c.url))} <span class="muted">→ ${c.status || "…"}</span>`).join("<br>");
+    invRows += `<div class="row"><span>Redirect chain</span><b>${hops}</b></div>`;
+  }
+  if (res.finalUrl && res.finalUrl !== `https://${res.domain}/`)
+    invRows += `<div class="row"><span>Final URL</span><b>${esc(shortUrl(res.finalUrl))}</b></div>`;
   const investigation = invRows
     ? `<div class="kicker" style="margin-top:24px">Investigation · the evidence</div>
        <div class="card">${invRows}</div>
@@ -479,6 +589,15 @@ async function handleCheck(domain, request, env) {
   const cdnNote = isCdn(res.brand)
     ? `<p class="note">⚡ This domain sits behind <b>${esc(res.brand)}</b>, a CDN / edge network — so "Hosted by" is the CDN, not the real server. We dug for the true origin below.</p>`
     : "";
+
+  // The verdict line — one plain-English sentence at the top.
+  const pctRow = res.up ? await env.DB.prepare(
+    "SELECT ROUND(100.0*AVG(CASE WHEN response_ms > ? THEN 1 ELSE 0 END)) p FROM checks WHERE up=1"
+  ).bind(res.ms).first() : null;
+  let verdict, vclass;
+  if (!res.up) { verdict = `<b>${esc(domain)}</b> appears to be down — the server didn't respond. 🔴`; vclass = "down"; }
+  else if (looksParked(res, oi)) { verdict = `<b>${esc(domain)}</b> is a parked domain — not hosting a real website. 🅿️`; vclass = "note"; }
+  else { const v = buildVerdict(res, pctRow?.p ?? null); verdict = v.line; vclass = v.cls; }
 
   const loc = res.country ? `${flag(res.country)} ${esc(res.country)}` : "—";
   const shareUrl = `${BASE}/check/${res.domain}`;
@@ -492,6 +611,8 @@ async function handleCheck(domain, request, env) {
     body: `
     <a class="back" href="/">← check another</a>
     <h1>${esc(domain)}</h1>
+    <div class="verdict ${vclass}">${verdict}</div>
+    ${res.loadBalanced ? `<p class="note">🔀 Load-balanced across multiple networks — the majority provider is shown.</p>` : ""}
     ${cdnNote}
     <div class="card">
       <div class="row"><span>Hosted by</span>
@@ -1301,6 +1422,10 @@ footer{max-width:980px;margin:56px auto 0;padding:30px 20px;border-top:1px solid
 .trustbadge.center{display:block;width:max-content;max-width:100%;margin:0 auto 10px;text-align:center}
 .statline{text-align:center;color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:.85rem;margin:2px 0 10px}
 .statline b{color:var(--brand)}
+.verdict{font-size:1.16rem;line-height:1.5;padding:15px 18px;border-radius:14px;border:1px solid var(--border);border-left:4px solid var(--brand);background:var(--surface);margin:8px 0 16px}
+.verdict.down{border-left-color:var(--down)}.verdict.warn{border-left-color:var(--warn)}
+.verdict.note{border-left-color:var(--warn)}.verdict.ok{border-left-color:var(--up)}
+.verdict b{font-weight:700}
 textarea{width:100%;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:var(--surface);color:var(--fg);font-family:'JetBrains Mono',monospace;font-size:.9rem;resize:vertical}
 textarea:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px var(--glow)}
 select{padding:11px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--fg);font-size:.95rem;max-width:46%}
