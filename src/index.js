@@ -110,6 +110,61 @@ async function dohTxt(name) {
   return (j.Answer || []).find(a => a.type === 16)?.data?.replace(/"/g, "") ?? null;
 }
 
+async function dohAll(name, type) {
+  try {
+    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${name}&type=${type}`,
+      { headers: { accept: "application/dns-json" } });
+    const j = await r.json();
+    return (j.Answer || []).map(a => a.data);
+  } catch { return []; }
+}
+
+const baseDomain = h => {
+  h = (h || "").replace(/\.$/, "").toLowerCase();
+  const p = h.split(".");
+  return p.length <= 2 ? h : p.slice(-2).join(".");
+};
+
+// Unmask the real origin behind a CDN, plus email / DNS host intel — all via DNS.
+// Mail and origin-leaking subdomains usually aren't proxied, so they betray the
+// true host even when the front door is Cloudflare/Akamai/etc.
+async function discoverOrigin(domain, mainProvider) {
+  const cdn = isCdn(mainProvider);
+  const subs = ["direct", "cpanel", "webmail", "ftp", "mail", "server", "origin", "webdisk"];
+  const [mxData, nsData, subIps] = await Promise.all([
+    dohAll(domain, "MX"),
+    dohAll(domain, "NS"),
+    cdn ? Promise.all(subs.map(s => resolveA(`${s}.${domain}`).catch(() => null))) : Promise.resolve([]),
+  ]);
+
+  // Email host: first MX record -> registrable domain (+ the network that runs it)
+  let mailHost = null, mailProvider = null;
+  if (mxData.length) {
+    const host = mxData[0].split(/\s+/).pop();          // "10 mail.example.com."
+    mailHost = baseDomain(host);
+    const mip = await resolveA(host).catch(() => null);
+    if (mip) { const a = await ipToAsn(mip).catch(() => null); if (a) mailProvider = a.name; }
+  }
+
+  // DNS host: first NS record -> registrable domain
+  const dnsHost = nsData.length ? baseDomain(nsData[0]) : null;
+
+  // Origin: first origin-leaking subdomain whose network isn't the CDN itself
+  let origin = null;
+  if (cdn) {
+    const found = subs.map((s, i) => ({ sub: s, ip: subIps[i] })).filter(x => x.ip);
+    const distinct = [...new Map(found.map(x => [x.ip, x])).values()].slice(0, 4);
+    for (const d of distinct) {
+      const a = await ipToAsn(d.ip).catch(() => null);
+      if (a && !isCdn(a.name)) {
+        origin = { ip: d.ip, provider: a.name, method: `${d.sub}.${domain}`, country: a.country };
+        break;
+      }
+    }
+  }
+  return { cdn, origin, mailHost, mailProvider, dnsHost };
+}
+
 // SSL cert expiry. fetch() won't give us the cert, so we open a raw TCP socket,
 // send a hand-built TLS 1.2 ClientHello, and read notAfter out of the handshake.
 async function getSslExpiry(domain) {
@@ -234,12 +289,16 @@ const withTimeout = (promise, ms) => Promise.race([
 
 async function measure(domain) {
   const t0 = Date.now();
-  let status = 0, up = false;
+  let status = 0, up = false, server = null;
   try {
     const r = await fetch(`https://${domain}/`, { redirect: "manual", cf: { cacheTtl: 0 } });
     status = r.status; up = true;
+    server = r.headers.get("server");
+    // From inside a Worker, Cloudflare's egress reports "cloudflare" regardless of
+    // the true origin — unreliable, so drop it and keep only revealing values.
+    if (server && server.toLowerCase() === "cloudflare") server = null;
   } catch (_) {}
-  return { ms: Date.now() - t0, status, up };
+  return { ms: Date.now() - t0, status, up, server };
 }
 
 // CDN / edge-network detection: if the A record points here, the true origin is masked.
@@ -257,9 +316,13 @@ async function apiCheck(url, request, env) {
   if (!domain) return json({ error: "invalid domain" }, 400);
   const res = await runCheck(domain, request.cf?.colo || "edge", env);
   if (!res) return json({ error: "lookup failed" }, 502);
+  const oi = await discoverOrigin(res.domain, res.provider);
   return json({
     domain: res.domain, ip: res.ip, asn: res.asn ? "AS" + res.asn : null,
     provider: res.provider, country: res.country, cdn: isCdn(res.provider),
+    origin_provider: oi.origin?.provider ?? null, origin_ip: oi.origin?.ip ?? null,
+    origin_found_via: oi.origin?.method ?? null,
+    email_host: oi.mailHost, dns_host: oi.dnsHost, server: res.server,
     up: res.up, response_ms: res.ms, http_status: res.status,
     ssl_expiry: res.sslExpiry ? new Date(res.sslExpiry).toISOString() : null,
   });
@@ -285,10 +348,31 @@ async function handleCheck(domain, request, env) {
     const date = new Date(res.sslExpiry).toISOString().slice(0, 10);
     const cls = days < 0 ? "down" : days <= 21 ? "warn" : "up";
     ssl = `<b><span class="${cls}">${days < 0 ? "expired" : days + " days left"}</span> · ${date}</b>`;
+  } else if (res.up) {
+    ssl = `<b class="muted">TLS 1.3+ · expiry not exposed (normal &amp; fine)</b>`;
   }
 
+  // Dig for the real origin behind a CDN, plus email / DNS / server intel.
+  const oi = await discoverOrigin(res.domain, res.provider);
+  let invRows = "";
+  if (oi.cdn) {
+    invRows += oi.origin
+      ? `<div class="row"><span>Real origin (likely)</span>
+           <b><a href="/host/${encodeURIComponent(oi.origin.provider)}">${esc(oi.origin.provider)}</a>${oi.origin.ip ? " · " + esc(oi.origin.ip) : ""}</b></div>
+         <div class="row"><span>Found via</span><b>${esc(oi.origin.method)}</b></div>`
+      : `<div class="row"><span>Real origin</span><b class="muted">not exposed via public signals — well shielded</b></div>`;
+  }
+  if (oi.mailHost) invRows += `<div class="row"><span>Email host</span><b>${esc(oi.mailHost)}${oi.mailProvider ? " · " + esc(oi.mailProvider) : ""}</b></div>`;
+  if (oi.dnsHost) invRows += `<div class="row"><span>DNS host</span><b>${esc(oi.dnsHost)}</b></div>`;
+  if (res.server) invRows += `<div class="row"><span>Server</span><b>${esc(res.server)}</b></div>`;
+  const investigation = invRows
+    ? `<div class="kicker" style="margin-top:24px">Investigation</div>
+       <div class="card">${invRows}</div>
+       ${oi.cdn ? `<p class="muted small">Origin found by probing records a CDN doesn't proxy (mail, common subdomains). A blank means the origin is genuinely well hidden.</p>` : ""}`
+    : "";
+
   const cdnNote = isCdn(res.provider)
-    ? `<p class="note">⚡ This domain sits behind <b>${esc(res.provider)}</b>, a CDN / edge network — the real origin server is masked. What you see below is the edge that answers for it.</p>`
+    ? `<p class="note">⚡ This domain sits behind <b>${esc(res.provider)}</b>, a CDN / edge network — so "Hosted by" is the CDN, not the real server. We dug for the true origin below.</p>`
     : "";
 
   const loc = res.country ? `${flag(res.country)} ${esc(res.country)}` : "—";
@@ -314,6 +398,8 @@ async function handleCheck(domain, request, env) {
       <div class="row"><span>Status</span><b>${badge}</b></div>
       <div class="row"><span>SSL certificate</span>${ssl}</div>
     </div>
+
+    ${investigation}
 
     <div class="actions">
       <a class="btn" href="/host/${encodeURIComponent(res.provider)}">See ${esc(res.provider)}'s ranking →</a>
