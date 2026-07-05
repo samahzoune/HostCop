@@ -42,6 +42,10 @@ export default {
       if (p === "/dns-propagation" || p.startsWith("/dns-propagation/")) return toolPropagation(toolDomain(url, p, "/dns-propagation"));
       if (p === "/dns" || p.startsWith("/dns/"))         return toolDns(toolDomain(url, p, "/dns"));
       if (p === "/redirect" || p.startsWith("/redirect/")) return toolRedirect(toolDomain(url, p, "/redirect"));
+      if (p === "/email" || p.startsWith("/email/"))     return toolEmail(toolDomain(url, p, "/email"));
+      if (p === "/headers" || p.startsWith("/headers/")) return toolHeaders(toolDomain(url, p, "/headers"));
+      if (p === "/reverse-ip" || p.startsWith("/reverse-ip/"))
+        return toolReverseIp((p.startsWith("/reverse-ip/") ? decodeURIComponent(p.slice(12)) : (url.searchParams.get("domain") || "")).trim().toLowerCase(), env);
       if (p === "/methodology")  return pageMethodology();
       if (p === "/about")        return pageAbout();
       if (p === "/guides")       return pageGuidesIndex();
@@ -1100,6 +1104,9 @@ const TOOLS = [
   ["/dns", "🗂️", "DNS lookup", "All records — A, AAAA, MX, TXT, NS, CNAME."],
   ["/redirect", "↪️", "Redirect checker", "Trace the full redirect chain."],
   ["/dns-propagation", "🌍", "DNS propagation", "Has your DNS updated across resolvers worldwide?"],
+  ["/email", "✉️", "Email checker", "SPF, DKIM & DMARC — will your mail land?"],
+  ["/headers", "🧾", "HTTP headers", "Response headers + a security grade."],
+  ["/reverse-ip", "🔁", "Reverse IP", "Other sites seen on the same IP."],
   ["/check", "🛡️", "Hosting report", "Who really hosts it — the full investigation."],
 ];
 
@@ -1269,6 +1276,119 @@ async function toolPropagation(domain) {
     h1: domain ? `${esc(domain)} DNS propagation` : "DNS propagation checker",
     intro: "Changed your DNS? See whether the update has reached the major public resolvers yet.",
     faq: `<h2>How long does propagation take?</h2><p>Usually minutes to a few hours, but it can take up to 48 hours depending on the record's TTL. Until every resolver agrees, some visitors reach the old server and some the new one.</p>` });
+}
+
+async function toolEmail(domain) {
+  let result = "";
+  if (domain) {
+    const [txt, dmarcTxt, mx] = await Promise.all([
+      dohAll(domain, "TXT"), dohAll("_dmarc." + domain, "TXT"), dohAll(domain, "MX")]);
+    const spf = txt.map(t => t.replace(/"/g, "")).find(t => /^v=spf1/i.test(t.trim())) || null;
+    const dmarc = dmarcTxt.map(t => t.replace(/"/g, "")).find(t => /v=DMARC1/i.test(t)) || null;
+    const selectors = ["default", "google", "selector1", "selector2", "k1", "dkim", "mail", "s1", "s2", "mandrill", "mailjet", "zoho", "fm1"];
+    const dkimResults = await Promise.all(selectors.map(s =>
+      dohAll(`${s}._domainkey.${domain}`, "TXT").then(r => ({ s, r })).catch(() => ({ s, r: [] }))));
+    const dkimHit = dkimResults.find(x => x.r.some(t => /v=DKIM1|k=rsa|p=[A-Za-z0-9]/i.test(t)));
+
+    let score = 0;
+    const spfAll = spf && /-all/.test(spf) ? "strict (-all)" : spf && /~all/.test(spf) ? "soft (~all)" : spf ? "present" : null;
+    if (spf) score += /-all/.test(spf) ? 2 : 1;
+    const dmarcPol = dmarc ? (dmarc.match(/p=(\w+)/i)?.[1]?.toLowerCase() || "none") : null;
+    if (dmarc) score += (dmarcPol === "reject" || dmarcPol === "quarantine") ? 2 : 1;
+    if (dkimHit) score += 2;
+    const grade = score >= 6 ? "A" : score >= 4 ? "B" : score >= 3 ? "C" : score >= 1 ? "D" : "F";
+    const gcls = (grade === "A" || grade === "B") ? "ok" : (grade === "C" || grade === "D") ? "warn" : "down";
+    const emoji = gcls === "ok" ? "✅" : gcls === "warn" ? "⚠️" : "🔴";
+    const yn = (ok, txt) => `<b>${ok ? `<span class="up">✓</span> ${txt}` : `<span class="down">✗</span> ${txt}`}</b>`;
+
+    result = `<div class="verdict ${gcls}"><b>${esc(domain)}</b>'s email authentication scores <b>${grade}</b>. ${emoji}</div>
+      <div class="card">
+        <div class="row"><span>SPF</span>${yn(!!spf, spf ? esc(spfAll) : "missing — anyone can spoof your domain")}</div>
+        <div class="row"><span>DKIM</span>${dkimHit ? `<b><span class="up">✓</span> found (selector ${esc(dkimHit.s)})</b>` : `<b><span class="warn">?</span> not found with common selectors</b>`}</div>
+        <div class="row"><span>DMARC</span>${dmarc ? `<b>${dmarcPol === "none" ? '<span class="warn">⚠</span>' : '<span class="up">✓</span>'} p=${esc(dmarcPol)}</b>` : `<b><span class="down">✗</span> missing</b>`}</div>
+        <div class="row"><span>MX (mail server)</span>${yn(!!mx.length, mx.length ? esc(baseDomain(mx[0].split(/\s+/).pop())) : "none")}</div>
+      </div>
+      <p class="muted small">DKIM uses a provider-specific selector; we probe common ones, so "not found" may just mean a custom selector. DMARC <b>p=none</b> only monitors — move to <b>quarantine</b> or <b>reject</b> to actually stop spoofing.</p>
+      ${crossLink(domain)}`;
+  }
+  return toolShell({
+    title: domain ? `${domain} email deliverability (SPF, DKIM, DMARC) · HostCop` : "Email deliverability checker — SPF, DKIM, DMARC · HostCop",
+    desc: domain ? `Is ${domain}'s email set up to land in inboxes? SPF, DKIM and DMARC checked and graded.` : "Check any domain's SPF, DKIM and DMARC records and get a deliverability grade.",
+    path: domain ? "/email/" + domain : "/email", base: "/email", domain, result,
+    h1: domain ? `${esc(domain)} email setup` : "Email deliverability checker",
+    intro: "Will your email land in the inbox? Check your SPF, DKIM and DMARC records and get a grade.",
+    faq: `<h2>What these do</h2><p><b>SPF</b> says which servers may send as you, <b>DKIM</b> cryptographically signs your mail, and <b>DMARC</b> tells receivers what to do with fakes. Missing any of them means your mail is easier to spoof and more likely to hit spam.</p>` });
+}
+
+async function toolHeaders(domain) {
+  let result = "";
+  if (domain) {
+    let headers = null;
+    try {
+      const r = await fetch(`https://${domain}/`, {
+        redirect: "follow", signal: AbortSignal.timeout(8000),
+        headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36" },
+      });
+      headers = r.headers;
+    } catch { }
+    if (!headers) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond — no headers to read. 🔴</div>${crossLink(domain)}`;
+    else {
+      const sec = [
+        ["strict-transport-security", "HSTS — forces HTTPS"],
+        ["content-security-policy", "CSP — blocks injection / XSS"],
+        ["x-frame-options", "clickjacking protection"],
+        ["x-content-type-options", "MIME-sniffing protection"],
+        ["referrer-policy", "referrer privacy"],
+        ["permissions-policy", "browser-feature control"],
+      ];
+      const n = sec.filter(([h]) => headers.get(h)).length;
+      const grade = n >= 5 ? "A" : n === 4 ? "B" : n === 3 ? "C" : n === 2 ? "D" : "F";
+      const gcls = n >= 4 ? "ok" : n >= 2 ? "warn" : "down";
+      const secRows = sec.map(([h, d]) => {
+        const v = headers.get(h);
+        return `<div class="row"><span>${h}<br><span class="muted small">${d}</span></span><b>${v ? '<span class="up">✓ present</span>' : '<span class="down">✗ missing</span>'}</b></div>`;
+      }).join("");
+      const allRows = [...headers].map(([k, v]) =>
+        `<div class="row"><span>${esc(k)}</span><b class="mono" style="word-break:break-all;font-weight:500">${esc(v.length > 160 ? v.slice(0, 160) + "…" : v)}</b></div>`).join("");
+      result = `<div class="verdict ${gcls}"><b>${esc(domain)}</b> — security-headers grade <b>${grade}</b> (${n}/6 present). ${gcls === "ok" ? "✅" : gcls === "warn" ? "⚠️" : "🔴"}</div>
+        <div class="kicker" style="margin-top:18px">Security headers</div>
+        <div class="card">${secRows}</div>
+        <div class="kicker" style="margin-top:18px">All response headers</div>
+        <div class="card">${allRows}</div>${crossLink(domain)}`;
+    }
+  }
+  return toolShell({
+    title: domain ? `${domain} HTTP headers & security grade · HostCop` : "HTTP header checker + security grade · HostCop",
+    desc: domain ? `HTTP response headers for ${domain} plus a security-headers grade (HSTS, CSP, and more).` : "Inspect any site's HTTP response headers and grade its security headers — HSTS, CSP, X-Frame-Options and more.",
+    path: domain ? "/headers/" + domain : "/headers", base: "/headers", domain, result,
+    h1: domain ? `${esc(domain)} HTTP headers` : "HTTP header checker",
+    intro: "See a site's full HTTP response headers and a grade for its security headers.",
+    faq: `<h2>Why security headers matter</h2><p>Headers like <b>HSTS</b>, <b>CSP</b> and <b>X-Frame-Options</b> defend visitors against downgrade attacks, cross-site scripting and clickjacking. They're free to add and a strong signal of a well-run site.</p>` });
+}
+
+async function toolReverseIp(input, env) {
+  let result = "";
+  if (input) {
+    const ip = /^\d{1,3}(\.\d{1,3}){3}$/.test(input) ? input : await resolveA(input);
+    if (!ip) result = `<div class="verdict note"><b>${esc(input)}</b> — couldn't resolve that to an IP. 🟡</div>`;
+    else {
+      const { results } = await env.DB.prepare(
+        "SELECT DISTINCT domain FROM checks WHERE ip=? ORDER BY domain LIMIT 100").bind(ip).all();
+      const list = results.map(r => `<a href="/check/${esc(r.domain)}">${esc(r.domain)}</a>`).join(" · ");
+      result = `<div class="verdict ${results.length ? "ok" : "note"}"><b>${esc(ip)}</b> — ${results.length} domain${results.length === 1 ? "" : "s"} seen on this IP in HostCop's data. ${results.length ? "✅" : "🟡"}</div>
+        ${results.length
+          ? `<div class="card"><div class="row"><span>Domains</span><b>${list}</b></div></div>`
+          : `<p class="note">We haven't recorded other domains on this IP yet — our reverse-IP data grows every time someone runs a check.</p>`}
+        ${crossLink(input)}`;
+    }
+  }
+  return toolShell({
+    title: input ? `Reverse IP lookup for ${input} · HostCop` : "Reverse IP lookup — sites on the same server · HostCop",
+    desc: input ? `Other domains HostCop has seen on the same IP as ${input}.` : "Find other websites sharing the same IP address, from HostCop's measured data.",
+    path: input ? "/reverse-ip/" + input : "/reverse-ip", base: "/reverse-ip", domain: input, result,
+    h1: input ? `Reverse IP · ${esc(input)}` : "Reverse IP lookup",
+    intro: "Enter a domain or IP to see what other sites share the same server, from HostCop's own data.",
+    faq: `<h2>What this tells you</h2><p>Sites on the same IP usually share a server. Lots of unrelated domains on one IP means cheap shared hosting; a dedicated IP is a sign of a more serious setup. This list is built from domains HostCop has actually measured, so it grows over time.</p>` });
 }
 
 // ========================================================================
@@ -1549,7 +1669,7 @@ function robots() {
 
 async function sitemap(env) {
   const staticUrls = ["/", "/hosts", "/compare", "/monitor", "/bulk", "/api",
-    "/tools", "/down", "/ssl", "/dns", "/redirect", "/dns-propagation",
+    "/tools", "/down", "/ssl", "/dns", "/redirect", "/dns-propagation", "/email", "/headers", "/reverse-ip",
     "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
     ...Object.keys(GUIDES).map(s => "/guides/" + s)];
   let providerUrls = [], compareUrls = [];
