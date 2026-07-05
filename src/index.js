@@ -36,6 +36,12 @@ export default {
       if (p === "/monitor")      return request.method === "POST" ? handleMonitorCreate(request, env) : pageMonitor(url);
       if (p === "/monitor/verify")      return handleMonitorVerify(url, env);
       if (p === "/monitor/unsubscribe") return handleMonitorUnsub(url, env);
+      if (p === "/tools")        return pageTools();
+      if (p === "/down" || p.startsWith("/down/"))       return toolDown(toolDomain(url, p, "/down"), env);
+      if (p === "/ssl" || p.startsWith("/ssl/"))         return toolSsl(toolDomain(url, p, "/ssl"));
+      if (p === "/dns-propagation" || p.startsWith("/dns-propagation/")) return toolPropagation(toolDomain(url, p, "/dns-propagation"));
+      if (p === "/dns" || p.startsWith("/dns/"))         return toolDns(toolDomain(url, p, "/dns"));
+      if (p === "/redirect" || p.startsWith("/redirect/")) return toolRedirect(toolDomain(url, p, "/redirect"));
       if (p === "/methodology")  return pageMethodology();
       if (p === "/about")        return pageAbout();
       if (p === "/guides")       return pageGuidesIndex();
@@ -1086,6 +1092,185 @@ async function runMonitors(env) {
   }
 }
 
+// ---- free tools (each = its own SEO landing page) -----------------------
+
+const TOOLS = [
+  ["/down", "🔴", "Is it down?", "Check if a website is down for everyone or just you."],
+  ["/ssl", "🔒", "SSL checker", "Certificate expiry, issuer and validity."],
+  ["/dns", "🗂️", "DNS lookup", "All records — A, AAAA, MX, TXT, NS, CNAME."],
+  ["/redirect", "↪️", "Redirect checker", "Trace the full redirect chain."],
+  ["/dns-propagation", "🌍", "DNS propagation", "Has your DNS updated across resolvers worldwide?"],
+  ["/check", "🛡️", "Hosting report", "Who really hosts it — the full investigation."],
+];
+
+const toolDomain = (url, p, base) =>
+  cleanDomain(p.startsWith(base + "/") ? decodeURIComponent(p.slice(base.length + 1)) : (url.searchParams.get("domain") || ""));
+
+const crossLink = d =>
+  `<div class="actions"><a class="btn" href="/check/${encodeURIComponent(d)}">🛡️ Full hosting report for ${esc(d)} →</a></div>`;
+
+function toolShell({ title, desc, path, h1, intro, base, domain, result, faq }) {
+  return html(layout({
+    title, desc, path, body: `
+    <div class="kicker">HostCop tools</div>
+    <h1>${h1}</h1>
+    <p class="lede" style="max-width:640px;margin:8px 0 18px">${intro}</p>
+    <form class="toolform" action="${base}" method="get">
+      <input name="domain" placeholder="yourdomain.com" value="${esc(domain || "")}" autocomplete="off" spellcheck="false"${domain ? "" : " autofocus"}>
+      <button>Check</button>
+    </form>
+    ${result || ""}
+    ${faq ? `<div class="prose" style="margin-top:30px">${faq}</div>` : ""}
+    <p class="muted small" style="margin-top:22px"><a href="/tools">← all HostCop tools</a></p>` }));
+}
+
+function pageTools() {
+  const cards = TOOLS.map(([href, icon, name, desc]) =>
+    `<a class="toolcard" href="${href}"><b>${icon} ${esc(name)}</b><span>${esc(desc)}</span></a>`).join("");
+  return html(layout({
+    title: "Free website tools — DNS, SSL, uptime, redirects · HostCop",
+    desc: "A fast, no-ads toolbox: check if a site is down, its SSL certificate, DNS records, redirect chain and DNS propagation — then see who really hosts it.",
+    path: "/tools",
+    body: `<h1>HostCop tools</h1>
+      <p class="lede" style="max-width:640px">Fast, neutral, no-ads website tools. Every one links straight to the full hosting investigation.</p>
+      <div class="toolgrid">${cards}</div>` }));
+}
+
+async function toolDown(domain, env) {
+  let result = "";
+  if (domain) {
+    const res = await runCheck(domain, "tool", env);
+    if (!res) result = `<p class="note">Couldn't check that domain — please try again.</p>`;
+    else if (res.noDns) result = `<div class="verdict down"><b>${esc(domain)}</b> doesn't resolve — no DNS records found. 🔴</div>${crossLink(domain)}`;
+    else if (res.up) result = `<div class="verdict ok"><b>${esc(domain)}</b> is UP — it responded in ${res.ms} ms (HTTP ${res.finalStatus}). ✅</div>
+      <p class="note">It's up from HostCop's network. If <b>you</b> can't reach it, the problem is most likely on your side — ISP, DNS cache, VPN or firewall. Try another network or flush your DNS.</p>
+      <div class="card"><div class="row"><span>Status</span><b><span class="up">UP</span> · HTTP ${res.finalStatus} · ${esc(statusText(res.finalStatus))}</b></div>
+        <div class="row"><span>Response time</span><b>${res.ms} ms</b></div>
+        <div class="row"><span>Hosted by</span><b>${esc(res.brand)}</b></div>
+        <div class="row"><span>IP</span><b>${esc(res.ip || "—")}</b></div></div>${crossLink(domain)}`;
+    else result = `<div class="verdict down"><b>${esc(domain)}</b> appears to be DOWN — no response. 🔴</div>
+      <p class="note">HostCop couldn't reach it. We check from a single network, so if it's an intermittent blip, retry in a minute.</p>${crossLink(domain)}`;
+  }
+  return toolShell({
+    title: domain ? `Is ${domain} down right now? · HostCop` : "Is it down? Website down checker · HostCop",
+    desc: domain ? `Is ${domain} down or is it just you? Live status, response time and who hosts it.` : "Check if any website is down for everyone or just you — live status from HostCop.",
+    path: domain ? "/down/" + domain : "/down", base: "/down", domain, result,
+    h1: domain ? `Is ${esc(domain)} down?` : "Is a website down?",
+    intro: "Enter a domain to see if it's down for everyone — or just you. We check it live and tell you what's actually happening.",
+    faq: `<h2>Down for everyone, or just me?</h2><p>If HostCop shows the site is <b>up</b> but you can't reach it, the outage is almost certainly local: your ISP, a stale DNS cache, a VPN, or a firewall. If HostCop also can't reach it, the site itself is likely having problems.</p>` });
+}
+
+async function toolSsl(domain) {
+  let result = "";
+  if (domain) {
+    const ssl = await getSslExpiry(domain);
+    if (!ssl || ssl.expiry == null) result = `<div class="verdict note"><b>${esc(domain)}</b> — couldn't read a certificate. 🟡</div>
+      <p class="note">The server may be TLS 1.3-only (its certificate isn't exposed to our probe), may not serve HTTPS, or may be unreachable right now.</p>${crossLink(domain)}`;
+    else {
+      const days = Math.round((ssl.expiry - Date.now()) / 86400000);
+      const cls = days < 0 ? "down" : days <= 21 ? "warn" : "ok";
+      const emoji = days < 0 ? "🔴" : days <= 21 ? "⚠️" : "✅";
+      const state = days < 0 ? `expired ${-days} day${days === -1 ? "" : "s"} ago` : `valid — expires in ${days} day${days === 1 ? "" : "s"}`;
+      result = `<div class="verdict ${cls}"><b>${esc(domain)}</b>'s SSL certificate is ${state}. ${emoji}</div>
+        <div class="card">
+          <div class="row"><span>Status</span><b>${days < 0 ? '<span class="down">Expired</span>' : '<span class="up">Valid</span>'}</b></div>
+          <div class="row"><span>Expires</span><b>${new Date(ssl.expiry).toISOString().slice(0, 10)}${days < 0 ? "" : ` · in ${days} days`}</b></div>
+          <div class="row"><span>Issuer</span><b>${esc(ssl.issuer || "—")}</b></div>
+        </div>${crossLink(domain)}`;
+    }
+  }
+  return toolShell({
+    title: domain ? `${domain} SSL certificate check · HostCop` : "SSL certificate checker · HostCop",
+    desc: domain ? `SSL certificate for ${domain}: expiry date, issuer and validity.` : "Check any site's SSL certificate — expiry date, issuer and validity, instantly.",
+    path: domain ? "/ssl/" + domain : "/ssl", base: "/ssl", domain, result,
+    h1: domain ? `${esc(domain)} SSL certificate` : "SSL certificate checker",
+    intro: "Check a site's SSL certificate: when it expires, who issued it, and whether it's still valid.",
+    faq: `<h2>Why it matters</h2><p>An expired certificate makes every browser show a big security warning and blocks visitors. HostCop reads the certificate straight from the server's TLS handshake — no third-party service involved.</p>` });
+}
+
+async function toolDns(domain) {
+  let result = "";
+  if (domain) {
+    const types = ["A", "AAAA", "MX", "TXT", "NS", "CNAME"];
+    const all = await Promise.all(types.map(t => dohAll(domain, t)));
+    const rows = types.map((t, i) => `<div class="row"><span>${t}</span><b>${all[i].length ? all[i].map(esc).join("<br>") : '<span class="muted">—</span>'}</b></div>`).join("");
+    result = `<div class="card">${rows}</div>${crossLink(domain)}`;
+  }
+  return toolShell({
+    title: domain ? `${domain} DNS records lookup · HostCop` : "DNS lookup — all records · HostCop",
+    desc: domain ? `DNS records for ${domain}: A, AAAA, MX, TXT, NS, CNAME.` : "Look up any domain's DNS records — A, AAAA, MX, TXT, NS and CNAME — instantly.",
+    path: domain ? "/dns/" + domain : "/dns", base: "/dns", domain, result,
+    h1: domain ? `${esc(domain)} DNS records` : "DNS lookup",
+    intro: "See every DNS record for a domain — A, AAAA, MX, TXT, NS and CNAME — in one place.",
+    faq: `<h2>What the records mean</h2><p><b>A/AAAA</b> point the domain at a server, <b>MX</b> routes its email, <b>TXT</b> holds SPF/verification data, <b>NS</b> is the authoritative DNS, and <b>CNAME</b> aliases one name to another.</p>` });
+}
+
+async function toolRedirect(domain) {
+  let result = "";
+  if (domain) {
+    const pr = await probe(domain);
+    if (!pr.up) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond — can't trace redirects. 🔴</div>${crossLink(domain)}`;
+    else if (pr.chain.length <= 1) result = `<div class="verdict ok"><b>${esc(domain)}</b> doesn't redirect — it serves directly (HTTP ${pr.finalStatus}). ✅</div>${crossLink(domain)}`;
+    else {
+      const hops = pr.chain.map((c, i) => `<div class="row"><span>Hop ${i + 1}</span><b>${esc(shortUrl(c.url))} <span class="muted">→ ${c.status}</span></b></div>`).join("");
+      const n = pr.chain.length - 1;
+      result = `<div class="verdict ${pr.loop ? "warn" : "ok"}"><b>${esc(domain)}</b> redirects through ${n} hop${n === 1 ? "" : "s"} to <b>${esc(shortUrl(pr.finalUrl))}</b>${pr.loop ? " — redirect loop detected ⚠️" : " ✅"}</div>
+        <div class="card">${hops}</div>${crossLink(domain)}`;
+    }
+  }
+  return toolShell({
+    title: domain ? `${domain} redirect chain · HostCop` : "Redirect checker — trace redirects · HostCop",
+    desc: domain ? `Full redirect chain for ${domain} — every hop and status code.` : "Trace a URL's full redirect chain — every hop and status code — with HostCop.",
+    path: domain ? "/redirect/" + domain : "/redirect", base: "/redirect", domain, result,
+    h1: domain ? `${esc(domain)} redirects` : "Redirect checker",
+    intro: "Follow a URL through every redirect to its final destination — with the status code at each hop.",
+    faq: `<h2>Why redirects matter</h2><p>Long redirect chains slow every visit and leak SEO value; loops break the page entirely. A clean setup is one hop (e.g. http→https or apex→www) straight to a 200.</p>` });
+}
+
+const RESOLVERS = [
+  ["Cloudflare (1.1.1.1)", d => `https://cloudflare-dns.com/dns-query?name=${d}&type=A`],
+  ["Google (8.8.8.8)", d => `https://dns.google/resolve?name=${d}&type=A`],
+  ["Quad9 (9.9.9.9)", d => `https://dns.quad9.net:5053/dns-query?name=${d}&type=A`],
+  ["DNS.SB", d => `https://doh.dns.sb/dns-query?name=${d}&type=A`],
+];
+async function resolverA(urlFn, domain) {
+  try {
+    const r = await fetch(urlFn(domain), { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(5000) });
+    const j = await r.json();
+    return (j.Answer || []).filter(a => a.type === 1).map(a => a.data).sort();
+  } catch { return null; }
+}
+async function toolPropagation(domain) {
+  let result = "";
+  if (domain) {
+    const answers = await Promise.all(RESOLVERS.map(([, fn]) => resolverA(fn, domain)));
+    const responded = answers.filter(a => a !== null);
+    const withRecords = responded.filter(a => a.length);
+    const someEmpty = responded.some(a => !a.length);
+    const uniqueSets = new Set(withRecords.map(a => a.join(",")));
+    const rows = RESOLVERS.map(([name], i) => {
+      const a = answers[i];
+      const val = a === null ? '<span class="muted">no response</span>' : a.length ? a.map(esc).join(", ") : '<span class="down">no record</span>';
+      return `<div class="row"><span>${esc(name)}</span><b>${val}</b></div>`;
+    }).join("");
+    let verdict, tail = "";
+    if (responded.length < 2) verdict = `<div class="verdict note"><b>${esc(domain)}</b> — not enough resolver responses to compare. 🟡</div>`;
+    else if (someEmpty && withRecords.length) { verdict = `<div class="verdict warn"><b>${esc(domain)}</b> — some resolvers don't see the record yet. Still propagating. ⚠️</div>`; }
+    else if (uniqueSets.size <= 1) verdict = `<div class="verdict ok"><b>${esc(domain)}</b>'s DNS is identical across every resolver — fully propagated. ✅</div>`;
+    else { verdict = `<div class="verdict note"><b>${esc(domain)}</b> resolves to different IPs per resolver. 🟡</div>`;
+      tail = `<p class="note">Different IPs don't necessarily mean a propagation delay — many big sites use <b>load-balancing / GeoDNS</b> and hand out different servers by region. If you just changed DNS, give it time; otherwise this is normal.</p>`; }
+    result = `${verdict}<div class="card">${rows}</div>${tail}
+      <p class="muted small">Checked across major public resolvers. After a DNS change, different resolvers pick it up at different times.</p>${crossLink(domain)}`;
+  }
+  return toolShell({
+    title: domain ? `${domain} DNS propagation check · HostCop` : "DNS propagation checker · HostCop",
+    desc: domain ? `Is ${domain}'s DNS propagated? Compared across major public resolvers.` : "Check whether your DNS change has propagated across major public resolvers worldwide.",
+    path: domain ? "/dns-propagation/" + domain : "/dns-propagation", base: "/dns-propagation", domain, result,
+    h1: domain ? `${esc(domain)} DNS propagation` : "DNS propagation checker",
+    intro: "Changed your DNS? See whether the update has reached the major public resolvers yet.",
+    faq: `<h2>How long does propagation take?</h2><p>Usually minutes to a few hours, but it can take up to 48 hours depending on the record's TTL. Until every resolver agrees, some visitors reach the old server and some the new one.</p>` });
+}
+
 // ========================================================================
 // ROUTES: content pages
 // ========================================================================
@@ -1157,6 +1342,12 @@ async function handleHome(env) {
         <div class="feat"><b>SSL expiry</b><span>When the TLS certificate runs out — before it bites you.</span></div>
         <div class="feat"><b>Live host rankings</b><span>Every check feeds a neutral, unbiased leaderboard.</span></div>
       </div>
+    </section>
+
+    <section>
+      <div class="kicker">Free tools</div>
+      <h2>A whole toolbox — fast, neutral, no ads</h2>
+      <div class="toolgrid">${TOOLS.map(([href, icon, name, d]) => `<a class="toolcard" href="${href}"><b>${icon} ${esc(name)}</b><span>${esc(d)}</span></a>`).join("")}</div>
     </section>
 
     <section class="why">
@@ -1357,7 +1548,9 @@ function robots() {
 }
 
 async function sitemap(env) {
-  const staticUrls = ["/", "/hosts", "/compare", "/monitor", "/bulk", "/api", "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
+  const staticUrls = ["/", "/hosts", "/compare", "/monitor", "/bulk", "/api",
+    "/tools", "/down", "/ssl", "/dns", "/redirect", "/dns-propagation",
+    "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
     ...Object.keys(GUIDES).map(s => "/guides/" + s)];
   let providerUrls = [], compareUrls = [];
   try {
@@ -1437,9 +1630,10 @@ function layout({ title, desc, path, body, home }) {
   <a class="brand" href="/"><svg class="emblem" viewBox="0 0 24 24"><path class="s" d="M12 2 4 5v6c0 5 3.4 8 8 9 4.6-1 8-4 8-9V5l-8-3Z"/><path class="s2" d="M12 2 4 5v6c0 5 3.4 8 8 9V2Z"/><circle class="g" cx="11.2" cy="10.2" r="2.4"/><path class="g" d="m13.1 12.1 2 2.2" stroke-linecap="round"/></svg>Host<span>Cop</span></a>
   <nav>
     <span class="livepill"><span class="livedot"></span>LIVE</span>
+    <a href="/tools">Tools</a>
     <a href="/hosts">Rankings</a>
+    <a href="/monitor">Monitor</a>
     <a href="/guides">Guides</a>
-    <a href="/methodology">Methodology</a>
     <a href="/about">About</a>
     <button class="themebtn" onclick="hcToggle()" aria-label="Toggle dark mode" title="Toggle theme">◐</button>
   </nav>
@@ -1448,7 +1642,7 @@ function layout({ title, desc, path, body, home }) {
 <footer>
   <div class="fcols">
     <div><b>HostCop</b><p class="muted">Neutral hosting watchdog. Measured data, never fake reviews. <b>No affiliate links.</b></p></div>
-    <div><a href="/hosts">Rankings</a><a href="/compare">Compare</a><a href="/monitor">Monitor</a><a href="/bulk">Bulk check</a><a href="/api">API</a><a href="/guides">Guides</a></div>
+    <div><a href="/tools">Tools</a><a href="/hosts">Rankings</a><a href="/compare">Compare</a><a href="/monitor">Monitor</a><a href="/bulk">Bulk check</a><a href="/api">API</a><a href="/guides">Guides</a></div>
     <div><a href="/methodology">Methodology</a><a href="/about">About</a><a href="/contact">Contact</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div>
   </div>
   <p class="muted small">© 2026 HostCop · Built on Cloudflare. Data is measured live and provided as-is.</p>
@@ -1586,6 +1780,14 @@ select{padding:11px 12px;border:1px solid var(--border);border-radius:10px;backg
 .compareform{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:16px 0}
 .monitorform{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0;max-width:560px}
 .monitorform input{flex:1;min-width:180px}
+.toolform{display:flex;gap:8px;margin:16px 0;max-width:480px}
+.toolform input{flex:1;min-width:0}
+.toolgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:18px 0}
+.toolcard{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px;color:var(--fg)}
+.toolcard:hover{text-decoration:none;border-color:var(--brand)}
+.toolcard b{display:block;font-family:'Space Grotesk',sans-serif;font-size:1.05rem;margin-bottom:3px}
+.toolcard span{color:var(--muted);font-size:.9rem}
+@media(max-width:560px){.toolgrid{grid-template-columns:1fr}}
 .cmp{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
 .cmp .col{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px}
 .cmp .col h3{margin:.1em 0 .6em;font-size:1.05rem;text-align:center}
