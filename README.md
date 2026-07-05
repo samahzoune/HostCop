@@ -26,11 +26,17 @@ wrangler dev
 ```
 
 ## Routes
-- `/`               — home, domain input box
-- `/check?domain=`  — detect host + measure + store the check
-- `/host/:provider` — live stats for one host (avg speed, uptime, sites)
-- `/hosts`          — leaderboard, ranked by measured uptime then speed
-- cron (30 min)     — re-pings every tracked domain to keep data fresh
+- `/`                    — home: hero + how-it-works + features + example + copy
+- `/check/:domain`       — detect host (+CDN flag), measure, store; shareable URL
+- `/check?domain=`       — same, query form (no-JS fallback)
+- `/api/check?domain=`   — JSON API (CORS-open) for the badge / external use
+- `/host/:provider`      — live stats + recent sites for one host
+- `/hosts?sort=`         — leaderboard (uptime | speed | tested)
+- `/badge/:domain.svg`   — embeddable "verified by HostCop" badge
+- `/methodology` `/about` `/guides` `/guides/:slug` `/privacy` `/terms` `/contact`
+- `/sitemap.xml` `/robots.txt` `/favicon.svg` `/og.svg`
+- `www.*` → apex 301 redirect; custom 404
+- cron (30 min)          — re-pings every tracked domain to keep data fresh
 
 ## How detection works (all free, all inside the Worker)
 - **A record**: Cloudflare DNS-over-HTTPS (`cloudflare-dns.com/dns-query`)

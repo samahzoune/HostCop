@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS checks (
   ip           TEXT,
   asn          TEXT,
   provider     TEXT,          -- cleaned org name, e.g. CLOUDFLARENET
+  country      TEXT,          -- ISO country of the IP's network (approx location)
   response_ms  INTEGER,
   http_status  INTEGER,
   up           INTEGER,       -- 1 = responded, 0 = down/error

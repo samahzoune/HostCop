@@ -1,6 +1,12 @@
 name = "hostcop"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
+workers_dev = true
+
+routes = [
+  { pattern = "hostcop.com", custom_domain = true },
+  { pattern = "www.hostcop.com", custom_domain = true },
+]
 
 # Re-check every monitored domain every 30 min so rankings stay live
 [triggers]
