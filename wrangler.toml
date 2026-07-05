@@ -1,0 +1,12 @@
+name = "hostcop"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# Re-check every monitored domain every 30 min so rankings stay live
+[triggers]
+crons = ["*/30 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hostcop"
+database_id = "6f75f0f9-91c3-42bd-b047-2425efdb3e49"
