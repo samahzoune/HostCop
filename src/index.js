@@ -29,6 +29,10 @@ export default {
       if (p === "/hosts")        return handleLeaderboard(url, env);
       if (p.startsWith("/host/"))  return handleProvider(decodeURIComponent(p.slice(6)), env);
       if (p.startsWith("/badge/")) return handleBadge(decodeURIComponent(p.slice(7)).replace(/\.svg$/, ""), env);
+      if (p === "/api")          return pageApi();
+      if (p === "/bulk")         return handleBulk();
+      if (p === "/compare")      return handleCompare(url, env, null);
+      if (p.startsWith("/compare/")) return handleCompare(url, env, decodeURIComponent(p.slice(9)));
       if (p === "/methodology")  return pageMethodology();
       if (p === "/about")        return pageAbout();
       if (p === "/guides")       return pageGuidesIndex();
@@ -64,7 +68,8 @@ async function runCheck(domain, region, env) {
   const asnInfo = ip ? await ipToAsn(ip) : null;
   const provider = asnInfo ? asnInfo.name : "Unknown";
   const country = asnInfo?.country ?? null;
-  const [perf, sslExpiry] = await Promise.all([measure(domain), getSslExpiry(domain)]);
+  const [perf, ssl] = await Promise.all([measure(domain), getSslExpiry(domain)]);
+  const sslExpiry = ssl?.expiry ?? null;
   const now = Date.now();
 
   await env.DB.prepare(
@@ -79,7 +84,7 @@ async function runCheck(domain, region, env) {
      ON CONFLICT(domain) DO UPDATE SET provider=excluded.provider, last_checked=excluded.last_checked`
   ).bind(domain, provider, now, now).run();
 
-  return { domain, ip, provider, country, asn: asnInfo?.asn ?? null, sslExpiry, ...perf };
+  return { domain, ip, provider, country, asn: asnInfo?.asn ?? null, sslExpiry, sslIssuer: ssl?.issuer ?? null, ...perf };
 }
 
 // Resolve A record via Cloudflare DNS-over-HTTPS (no key needed)
@@ -192,12 +197,49 @@ async function getSslExpiry(domain) {
     try { reader.releaseLock(); writer.releaseLock(); } catch {}
     await socket.close().catch(() => {});
     if (!der || der === "ALERT") return null;
-    return parseNotAfter(der);
+    let expiry = null, issuer = null;
+    try { expiry = parseNotAfter(der); } catch {}
+    try { issuer = parseIssuer(der); } catch {}
+    return { expiry, issuer };
   } catch {
     try { await socket?.close(); } catch {}
     return null;
   }
 }
+
+// Pull the issuer organisation (O), falling back to CN, out of the cert DER.
+function parseIssuer(der) {
+  const cert = tlv(der, 0);
+  const tbs = tlv(der, cert.headerEnd);
+  const kids = [];
+  let p = tbs.headerEnd;
+  while (p < tbs.valueEnd) { const c = tlv(der, p); kids.push(c); p = c.valueEnd; }
+  const vi = kids[0].tag === 0xa0 ? 4 : 3;      // validity index
+  const issuer = kids[vi - 1];                   // issuer Name is right before it
+  const buf = der.subarray(issuer.headerEnd, issuer.valueEnd);
+  const find = oid => {
+    for (let i = 0; i + oid.length < buf.length; i++) {
+      let m = true;
+      for (let k = 0; k < oid.length; k++) if (buf[i + k] !== oid[k]) { m = false; break; }
+      if (m) { const v = tlv(buf, i + oid.length); return new TextDecoder().decode(buf.subarray(v.headerEnd, v.valueEnd)); }
+    }
+    return null;
+  };
+  return find([0x06, 0x03, 0x55, 0x04, 0x0a]) || find([0x06, 0x03, 0x55, 0x04, 0x03]); // O, then CN
+}
+
+// Reverse DNS (PTR) for an IP — evidence about the machine behind the address.
+async function reverseDns(ip) {
+  const rev = ip.split(".").reverse().join(".") + ".in-addr.arpa";
+  const a = await dohAll(rev, "PTR");
+  return a.length ? a[0].replace(/\.$/, "") : null;
+}
+
+// Generic wholesale infrastructure — if a "host" really runs here, it's a reseller.
+const INFRA_NAMES = ["AMAZON", "AWS", "GOOGLE", "MICROSOFT", "AZURE", "HETZNER", "OVH",
+  "DIGITALOCEAN", "LINODE", "AKAMAI-LINODE", "VULTR", "SOFTLAYER", "IBM", "INTERNAP",
+  "LEASEWEB", "CONTABO", "ORACLE", "SCALEWAY", "ONLINE-NET", "DATACAMP", "PACKET"];
+const isInfra = name => { const u = (name || "").toUpperCase(); return INFRA_NAMES.some(c => u.includes(c)); };
 
 // Minimal TLS 1.2 ClientHello with SNI; we omit supported_versions so a TLS 1.3
 // server falls back to 1.2 and sends its Certificate in the clear.
@@ -316,15 +358,21 @@ async function apiCheck(url, request, env) {
   if (!domain) return json({ error: "invalid domain" }, 400);
   const res = await runCheck(domain, request.cf?.colo || "edge", env);
   if (!res) return json({ error: "lookup failed" }, 502);
-  const oi = await discoverOrigin(res.domain, res.provider);
+  const [oi, rdns] = await Promise.all([
+    discoverOrigin(res.domain, res.provider),
+    res.ip ? reverseDns(res.ip) : Promise.resolve(null),
+  ]);
   return json({
     domain: res.domain, ip: res.ip, asn: res.asn ? "AS" + res.asn : null,
     provider: res.provider, country: res.country, cdn: isCdn(res.provider),
     origin_provider: oi.origin?.provider ?? null, origin_ip: oi.origin?.ip ?? null,
     origin_found_via: oi.origin?.method ?? null,
-    email_host: oi.mailHost, dns_host: oi.dnsHost, server: res.server,
+    reseller: !!(oi.origin && isInfra(oi.origin.provider)),
+    email_host: oi.mailHost, dns_host: oi.dnsHost,
+    reverse_dns: rdns, server: res.server,
     up: res.up, response_ms: res.ms, http_status: res.status,
     ssl_expiry: res.sslExpiry ? new Date(res.sslExpiry).toISOString() : null,
+    ssl_issuer: res.sslIssuer ?? null,
   });
 }
 
@@ -347,27 +395,38 @@ async function handleCheck(domain, request, env) {
     const days = Math.round((res.sslExpiry - Date.now()) / 86400000);
     const date = new Date(res.sslExpiry).toISOString().slice(0, 10);
     const cls = days < 0 ? "down" : days <= 21 ? "warn" : "up";
-    ssl = `<b><span class="${cls}">${days < 0 ? "expired" : days + " days left"}</span> · ${date}</b>`;
+    ssl = `<b><span class="${cls}">${days < 0 ? "expired" : days + " days left"}</span> · ${date}${res.sslIssuer ? " · " + esc(res.sslIssuer) : ""}</b>`;
   } else if (res.up) {
     ssl = `<b class="muted">TLS 1.3+ · expiry not exposed (normal &amp; fine)</b>`;
   }
 
-  // Dig for the real origin behind a CDN, plus email / DNS / server intel.
-  const oi = await discoverOrigin(res.domain, res.provider);
+  // Dig for the real origin behind a CDN, plus email / DNS intel and reverse DNS.
+  const [oi, rdns] = await Promise.all([
+    discoverOrigin(res.domain, res.provider),
+    res.ip ? reverseDns(res.ip) : Promise.resolve(null),
+  ]);
+
   let invRows = "";
+  let resellerNote = "";
   if (oi.cdn) {
-    invRows += oi.origin
-      ? `<div class="row"><span>Real origin (likely)</span>
+    if (oi.origin) {
+      invRows += `<div class="row"><span>Real origin (likely)</span>
            <b><a href="/host/${encodeURIComponent(oi.origin.provider)}">${esc(oi.origin.provider)}</a>${oi.origin.ip ? " · " + esc(oi.origin.ip) : ""}</b></div>
-         <div class="row"><span>Found via</span><b>${esc(oi.origin.method)}</b></div>`
-      : `<div class="row"><span>Real origin</span><b class="muted">not exposed via public signals — well shielded</b></div>`;
+         <div class="row"><span>Found via</span><b>${esc(oi.origin.method)}</b></div>`;
+      if (isInfra(oi.origin.provider))
+        resellerNote = `<p class="note">🔎 <b>Reseller / white-label:</b> the real machine runs on <b>${esc(oi.origin.provider)}</b> (wholesale infrastructure). The brand on the invoice is likely reselling it.</p>`;
+    } else {
+      invRows += `<div class="row"><span>Real origin</span><b class="muted">not exposed via public signals — well shielded</b></div>`;
+    }
   }
   if (oi.mailHost) invRows += `<div class="row"><span>Email host</span><b>${esc(oi.mailHost)}${oi.mailProvider ? " · " + esc(oi.mailProvider) : ""}</b></div>`;
   if (oi.dnsHost) invRows += `<div class="row"><span>DNS host</span><b>${esc(oi.dnsHost)}</b></div>`;
+  if (rdns) invRows += `<div class="row"><span>Reverse DNS</span><b>${esc(rdns)}</b></div>`;
   if (res.server) invRows += `<div class="row"><span>Server</span><b>${esc(res.server)}</b></div>`;
   const investigation = invRows
-    ? `<div class="kicker" style="margin-top:24px">Investigation</div>
+    ? `<div class="kicker" style="margin-top:24px">Investigation · the evidence</div>
        <div class="card">${invRows}</div>
+       ${resellerNote}
        ${oi.cdn ? `<p class="muted small">Origin found by probing records a CDN doesn't proxy (mail, common subdomains). A blank means the origin is genuinely well hidden.</p>` : ""}`
     : "";
 
@@ -506,8 +565,10 @@ async function handleLeaderboard(url, env) {
     path: "/hosts",
     body: `
     <h1>Host rankings</h1>
-    <p class="muted">Ranked from live measured data — real uptime and response time, crowdsourced from every domain checked. Minimum 3 checks to appear. No reviews, no paid placement.</p>
+    <div class="trustbadge">🛡 No affiliate links · No paid placements · Just measured data</div>
+    <p class="muted">Ranked from live measured data — real uptime and response time, crowdsourced from every domain checked. Minimum 3 checks to appear.</p>
     <div class="pills">${tab("uptime", "Most reliable")}${tab("speed", "Fastest")}${tab("tested", "Most tested")}</div>
+    <p class="muted small">Want two head-to-head? <a href="/compare">Compare any two hosts →</a></p>
     <table>
       <tr><th>#</th><th>Host</th><th>Uptime</th><th>Avg</th><th>Sites</th><th>Updated</th></tr>
       ${rows}
@@ -543,6 +604,146 @@ async function handleBadge(domain, env) {
     "content-type": "image/svg+xml",
     "cache-control": "max-age=3600",
   } });
+}
+
+// ---- compare + bulk + API docs ------------------------------------------
+
+async function providerStats(env, provider) {
+  const r = await env.DB.prepare(
+    `SELECT COUNT(*) checks, COUNT(DISTINCT domain) sites,
+            ROUND(AVG(response_ms)) avg_ms,
+            ROUND(100.0*SUM(up)/COUNT(*),1) uptime
+     FROM checks WHERE provider = ?`).bind(provider).first();
+  return r && r.checks ? r : null;
+}
+
+async function topProviders(env, n) {
+  const { results } = await env.DB.prepare(
+    `SELECT provider FROM checks WHERE provider!='Unknown'
+     GROUP BY provider HAVING COUNT(*)>=3 ORDER BY COUNT(*) DESC LIMIT ?`).bind(n).all();
+  return results.map(r => r.provider);
+}
+
+const provSlug = s => (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+async function handleCompare(url, env, pathSlug) {
+  const provs = await topProviders(env, 80);
+  let a = url.searchParams.get("a"), b = url.searchParams.get("b");
+  if (pathSlug && (!a || !b)) {
+    const [sa, sb] = pathSlug.split("-vs-");
+    a = a || provs.find(p => provSlug(p) === sa);
+    b = b || provs.find(p => provSlug(p) === sb);
+  }
+  const opts = sel => `<option value="">— pick —</option>` +
+    provs.map(p => `<option value="${esc(p)}"${p === sel ? " selected" : ""}>${esc(p)}</option>`).join("");
+  const picker = `<form class="compareform" action="/compare" method="get">
+      <select name="a">${opts(a)}</select><span class="muted">vs</span>
+      <select name="b">${opts(b)}</select><button>Compare</button></form>`;
+
+  if (!a || !b || a === b) {
+    return html(layout({
+      title: "Compare web hosts head-to-head · HostCop",
+      desc: "Compare any two hosting providers on real measured uptime and response time — neutral data, no affiliate bias.",
+      path: "/compare",
+      body: `<h1>Compare hosts head-to-head</h1>
+        <p class="muted">Two providers side by side, on data we measured ourselves — not opinions. Pick two:</p>
+        ${picker}
+        ${a && b && a === b ? '<p class="muted">Pick two different hosts.</p>' : ""}` }));
+  }
+
+  const [sa, sb] = await Promise.all([providerStats(env, a), providerStats(env, b)]);
+  const side = (name, s, o) => `<div class="col">
+      <h3><a href="/host/${encodeURIComponent(name)}">${esc(name)}</a></h3>
+      ${s ? `<div class="m"><span>avg response</span><b class="${o && s.avg_ms <= o.avg_ms ? "win" : ""}">${s.avg_ms} ms</b></div>
+      <div class="m"><span>uptime</span><b class="${o && s.uptime >= o.uptime ? "win" : ""}">${s.uptime}%</b></div>
+      <div class="m"><span>sites tested</span><b>${s.sites}</b></div>
+      <div class="m"><span>total checks</span><b>${s.checks}</b></div>`
+      : `<p class="muted">No measured data yet.</p>`}</div>`;
+
+  return html(layout({
+    title: `${a} vs ${b} — real hosting performance · HostCop`,
+    desc: `${a} vs ${b} compared on live measured uptime and response time. Neutral, no affiliate bias.`,
+    path: `/compare/${provSlug(a)}-vs-${provSlug(b)}`,
+    body: `<a class="back" href="/compare">← compare others</a>
+      <h1>${esc(a)} <span class="muted">vs</span> ${esc(b)}</h1>
+      <p class="muted">Head-to-head on data HostCop measured — no reviews, no paid placement.</p>
+      <div class="cmp">${side(a, sa, sb)}${side(b, sb, sa)}</div>
+      ${picker}
+      <p class="muted small">Winner highlighted per metric (faster response, higher uptime). Minimum 3 checks per host.</p>` }));
+}
+
+function handleBulk() {
+  return html(layout({
+    title: "Bulk host checker — many domains at once · HostCop",
+    desc: "Paste up to 30 domains and see who hosts each, the real origin behind CDNs, status and SSL — all at once.",
+    path: "/bulk",
+    body: `<h1>Bulk host checker</h1>
+      <p class="muted">Paste up to 30 domains (one per line). We detect the host, the real origin behind CDNs, status and SSL for each.</p>
+      <textarea id="bulkin" rows="7" placeholder="example.com&#10;anothersite.com"></textarea>
+      <div class="actions"><button onclick="hcBulk()">Check all</button></div>
+      <table><thead><tr><th>Domain</th><th>Host (→ real origin)</th><th>Loc</th><th>Status</th><th>SSL</th></tr></thead>
+      <tbody id="bulkbody"><tr><td colspan="5" class="muted">Results appear here.</td></tr></tbody></table>
+      <script>
+      function hcBulk(){
+        var ta=document.getElementById('bulkin');
+        var ds=ta.value.split(/\\s+/).map(function(s){return s.trim().toLowerCase().replace(/^https?:\\/\\//,'').replace(/\\/.*$/,'');}).filter(Boolean).slice(0,30);
+        var tb=document.getElementById('bulkbody'); tb.innerHTML='';
+        if(!ds.length){tb.innerHTML='<tr><td colspan="5" class="muted">No valid domains.</td></tr>';return;}
+        function e(x){return (x==null?'':String(x)).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+        var i=0;
+        function next(){
+          if(i>=ds.length)return;
+          var d=ds[i++];
+          var tr=document.createElement('tr'); tr.innerHTML='<td>'+e(d)+'</td><td colspan="4" class="muted">checking…</td>'; tb.appendChild(tr);
+          fetch('/api/check?domain='+encodeURIComponent(d)).then(function(r){return r.json();}).then(function(j){
+            var host=j.cdn?(j.origin_provider?(e(j.provider)+' → <b>'+e(j.origin_provider)+'</b>'):e(j.provider)+' (CDN)'):e(j.provider||'—');
+            var st=j.up?('<span class="up">UP</span> '+j.response_ms+'ms'):'<span class="down">DOWN</span>';
+            var ssl=j.ssl_expiry?e(j.ssl_expiry.slice(0,10)):'—';
+            tr.innerHTML='<td><a href="/check/'+encodeURIComponent(d)+'">'+e(d)+'</a></td><td>'+host+'</td><td>'+e(j.country||'')+'</td><td>'+st+'</td><td>'+ssl+'</td>';
+          }).catch(function(){tr.innerHTML='<td>'+e(d)+'</td><td colspan="4" class="muted">failed</td>';}).finally(function(){next();});
+        }
+        for(var k=0;k<Math.min(4,ds.length);k++)next();
+      }
+      </script>` }));
+}
+
+function pageApi() {
+  const sample = "GET https://hostcop.com/api/check?domain=example.com";
+  const body = `{
+  "domain": "example.com",
+  "provider": "CLOUDFLARENET - Cloudflare, Inc.",
+  "cdn": true,
+  "origin_provider": "AMAZON-AES - Amazon.com, Inc.",
+  "origin_found_via": "webmail.example.com",
+  "reseller": true,
+  "email_host": "google.com",
+  "dns_host": "cloudflare.com",
+  "reverse_dns": "server123.host.net",
+  "up": true,
+  "response_ms": 120,
+  "http_status": 200,
+  "ssl_expiry": "2026-09-30T23:59:59.000Z",
+  "ssl_issuer": "Let's Encrypt"
+}`;
+  return contentPage("API", "/api",
+    "Free HostCop API — detect the host, the real origin behind CDNs, and live performance as JSON. No key required.",
+    `<h1>HostCop API</h1>
+     <p>A free, no-key JSON endpoint. CORS is open, so you can call it straight from the browser. Please be reasonable — each call runs a live check.</p>
+     <h2>Endpoint</h2>
+     <pre class="code">${esc(sample)}</pre>
+     <h2>Example response</h2>
+     <pre class="code">${esc(body)}</pre>
+     <h2>Fields</h2>
+     <ul>
+       <li><b>provider</b> — the network the domain resolves to (the CDN, if it's fronted).</li>
+       <li><b>cdn</b> — true when that network is a CDN / edge.</li>
+       <li><b>origin_provider / origin_found_via</b> — the real host behind the CDN, and how we found it.</li>
+       <li><b>reseller</b> — true when the real origin is wholesale infrastructure (AWS, Hetzner…).</li>
+       <li><b>email_host / dns_host / reverse_dns / server</b> — supporting evidence.</li>
+       <li><b>up / response_ms / http_status</b> — live reachability and speed.</li>
+       <li><b>ssl_expiry / ssl_issuer</b> — certificate expiry and issuer (null on TLS 1.3-only servers).</li>
+     </ul>
+     <p class="muted">Need higher volume, bulk, or monitoring? That's the planned paid tier — <a href="/contact">tell us what you need</a>.</p>`);
 }
 
 // ========================================================================
@@ -790,16 +991,17 @@ function robots() {
 }
 
 async function sitemap(env) {
-  const staticUrls = ["/", "/hosts", "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
+  const staticUrls = ["/", "/hosts", "/compare", "/bulk", "/api", "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
     ...Object.keys(GUIDES).map(s => "/guides/" + s)];
-  let providerUrls = [];
+  let providerUrls = [], compareUrls = [];
   try {
-    const { results } = await env.DB.prepare(
-      "SELECT provider, COUNT(*) c FROM checks WHERE provider!='Unknown' GROUP BY provider HAVING c>=3 LIMIT 200"
-    ).all();
-    providerUrls = results.map(r => "/host/" + encodeURIComponent(r.provider));
+    const top = await topProviders(env, 200);
+    providerUrls = top.map(p => "/host/" + encodeURIComponent(p));
+    // Seed a batch of comparison pages between the most-tested hosts for SEO.
+    for (let i = 0; i + 1 < Math.min(top.length, 24); i += 2)
+      compareUrls.push(`/compare/${provSlug(top[i])}-vs-${provSlug(top[i + 1])}`);
   } catch {}
-  const urls = [...staticUrls, ...providerUrls]
+  const urls = [...staticUrls, ...providerUrls, ...compareUrls]
     .map(u => `<url><loc>${BASE}${u}</loc></url>`).join("");
   return new Response(`<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls}</urlset>`,
@@ -880,8 +1082,8 @@ function layout({ title, desc, path, body, home }) {
 <footer>
   <div class="fcols">
     <div><b>HostCop</b><p class="muted">Neutral hosting watchdog. Measured data, never fake reviews. <b>No affiliate links.</b></p></div>
-    <div><a href="/hosts">Rankings</a><a href="/guides">Guides</a><a href="/methodology">Methodology</a></div>
-    <div><a href="/about">About</a><a href="/contact">Contact</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div>
+    <div><a href="/hosts">Rankings</a><a href="/compare">Compare</a><a href="/bulk">Bulk check</a><a href="/api">API</a><a href="/guides">Guides</a></div>
+    <div><a href="/methodology">Methodology</a><a href="/about">About</a><a href="/contact">Contact</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div>
   </div>
   <p class="muted small">© 2026 HostCop · Built on Cloudflare. Data is measured live and provided as-is.</p>
 </footer>
@@ -1003,6 +1205,18 @@ footer{max-width:980px;margin:56px auto 0;padding:30px 20px;border-top:1px solid
 .fcols{display:grid;grid-template-columns:2fr 1fr 1fr;gap:20px}
 .fcols a{display:block;color:var(--muted);font-size:.92rem;padding:2px 0}
 .fcols>div>b{font-family:'Space Grotesk',sans-serif;font-weight:700}
+.trustbadge{display:inline-block;background:var(--tag);color:var(--tagfg);border:1px solid var(--border);border-radius:999px;padding:7px 14px;font-family:'JetBrains Mono',monospace;font-size:.76rem;margin:2px 0 12px}
+textarea{width:100%;padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:var(--surface);color:var(--fg);font-family:'JetBrains Mono',monospace;font-size:.9rem;resize:vertical}
+textarea:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px var(--glow)}
+select{padding:11px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--fg);font-size:.95rem;max-width:46%}
+.compareform{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:16px 0}
+.cmp{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
+.cmp .col{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px}
+.cmp .col h3{margin:.1em 0 .6em;font-size:1.05rem;text-align:center}
+.cmp .m{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--line);font-family:'JetBrains Mono',monospace;font-size:.9rem}
+.cmp .m:last-child{border:0}.cmp .m span{color:var(--muted)}
+.win{color:var(--up)}
+pre.code{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--brand);border-radius:10px;padding:14px;overflow-x:auto;font-family:'JetBrains Mono',monospace;font-size:.82rem;line-height:1.5;color:var(--fg)}
 #overlay{display:none;position:fixed;inset:0;background:var(--bg);z-index:60;flex-direction:column;align-items:center;justify-content:center;gap:16px}
 #overlay p{color:var(--muted);font-family:'JetBrains Mono',monospace;font-size:.9rem}
 .spin{width:42px;height:42px;border:3px solid var(--border);border-top-color:var(--brand);border-radius:50%;animation:sp 1s linear infinite}
