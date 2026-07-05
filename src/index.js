@@ -5,6 +5,8 @@
 import { connect } from "cloudflare:sockets";
 
 const BASE = "https://hostcop.com";
+const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/125.0 Safari/537.36";
 
 export default {
   async fetch(request, env) {
@@ -46,6 +48,8 @@ export default {
       if (p === "/headers" || p.startsWith("/headers/")) return toolHeaders(toolDomain(url, p, "/headers"));
       if (p === "/reverse-ip" || p.startsWith("/reverse-ip/"))
         return toolReverseIp((p.startsWith("/reverse-ip/") ? decodeURIComponent(p.slice(12)) : (url.searchParams.get("domain") || "")).trim().toLowerCase(), env);
+      if (p === "/whois" || p.startsWith("/whois/"))     return toolWhois(toolDomain(url, p, "/whois"));
+      if (p === "/tech" || p.startsWith("/tech/"))       return toolTech(toolDomain(url, p, "/tech"));
       if (p === "/methodology")  return pageMethodology();
       if (p === "/about")        return pageAbout();
       if (p === "/guides")       return pageGuidesIndex();
@@ -1107,6 +1111,8 @@ const TOOLS = [
   ["/email", "✉️", "Email checker", "SPF, DKIM & DMARC — will your mail land?"],
   ["/headers", "🧾", "HTTP headers", "Response headers + a security grade."],
   ["/reverse-ip", "🔁", "Reverse IP", "Other sites seen on the same IP."],
+  ["/whois", "🗓️", "WHOIS & age", "Domain age, registrar, expiry."],
+  ["/tech", "🔎", "Tech stack", "CMS, framework, server, analytics."],
   ["/check", "🛡️", "Hosting report", "Who really hosts it — the full investigation."],
 ];
 
@@ -1391,6 +1397,127 @@ async function toolReverseIp(input, env) {
     faq: `<h2>What this tells you</h2><p>Sites on the same IP usually share a server. Lots of unrelated domains on one IP means cheap shared hosting; a dedicated IP is a sign of a more serious setup. This list is built from domains HostCop has actually measured, so it grows over time.</p>` });
 }
 
+function vcardFn(entity) {
+  const v = entity?.vcardArray;
+  if (!Array.isArray(v) || v.length < 2) return null;
+  return v[1].find(p => p[0] === "fn")?.[3] || null;
+}
+function humanAge(dateStr) {
+  const then = Date.parse(dateStr);
+  if (isNaN(then)) return null;
+  const months = Math.floor((Date.now() - then) / (86400000 * 30.44));
+  if (months < 1) return "less than a month";
+  const y = Math.floor(months / 12), m = months % 12;
+  return [y ? `${y} year${y > 1 ? "s" : ""}` : "", m ? `${m} month${m > 1 ? "s" : ""}` : ""].filter(Boolean).join(", ");
+}
+
+async function toolWhois(domain) {
+  let result = "";
+  if (domain) {
+    let j = null;
+    try {
+      const r = await fetch(`https://rdap.org/domain/${domain}`,
+        { headers: { accept: "application/rdap+json", "user-agent": BROWSER_UA }, redirect: "follow", signal: AbortSignal.timeout(8000) });
+      if (r.ok) j = await r.json();
+    } catch { }
+    if (!j) result = `<div class="verdict note"><b>${esc(domain)}</b> — no WHOIS/RDAP data available (some TLDs don't publish it). 🟡</div>${crossLink(domain)}`;
+    else {
+      const ev = a => j.events?.find(e => e.eventAction === a)?.eventDate || null;
+      const created = ev("registration"), expires = ev("expiration"), updated = ev("last changed");
+      const regName = vcardFn(j.entities?.find(e => e.roles?.includes("registrar")));
+      const ns = (j.nameservers || []).map(n => n.ldhName?.toLowerCase()).filter(Boolean);
+      const status = (j.status || []).join(", ");
+      const age = created ? humanAge(created) : null;
+      result = `<div class="verdict ok"><b>${esc(domain)}</b>${age ? ` is ${age} old` : ""}${created ? ` — registered ${esc(created.slice(0, 10))}` : ""}. 🗓️</div>
+        <div class="card">
+          <div class="row"><span>Registered</span><b>${created ? esc(created.slice(0, 10)) + (age ? ` · ${age} ago` : "") : "—"}</b></div>
+          <div class="row"><span>Expires</span><b>${expires ? esc(expires.slice(0, 10)) : "—"}</b></div>
+          <div class="row"><span>Last updated</span><b>${updated ? esc(updated.slice(0, 10)) : "—"}</b></div>
+          <div class="row"><span>Registrar</span><b>${esc(regName || "—")}</b></div>
+          <div class="row"><span>Nameservers</span><b>${ns.length ? ns.map(esc).join("<br>") : "—"}</b></div>
+          ${status ? `<div class="row"><span>Status</span><b class="muted" style="font-weight:500">${esc(status)}</b></div>` : ""}
+        </div>${crossLink(domain)}`;
+    }
+  }
+  return toolShell({
+    title: domain ? `${domain} WHOIS & domain age · HostCop` : "WHOIS & domain age lookup · HostCop",
+    desc: domain ? `When was ${domain} registered? Domain age, registrar, expiry and nameservers.` : "Look up any domain's age, registrar, registration and expiry dates via RDAP.",
+    path: domain ? "/whois/" + domain : "/whois", base: "/whois", domain, result,
+    h1: domain ? `${esc(domain)} — WHOIS & age` : "WHOIS & domain age",
+    intro: "How old is a domain, who registered it, and when does it expire? Pulled live from official RDAP.",
+    faq: `<h2>Why domain age matters</h2><p>An older domain usually signals an established, more trustworthy business, while a domain registered days ago is a common scam signal. Registrar and expiry dates also tell you whether a site is well-maintained or about to lapse.</p>` });
+}
+
+// Tech-stack fingerprints from HTML + response headers.
+async function toolTech(domain) {
+  let result = "";
+  if (domain) {
+    let H = "", hdr = {}, ok = false;
+    try {
+      const r = await fetch(`https://${domain}/`, { redirect: "follow", signal: AbortSignal.timeout(8000), headers: { "user-agent": BROWSER_UA } });
+      for (const [k, v] of r.headers) hdr[k.toLowerCase()] = v;
+      H = (await r.text()).slice(0, 250000);
+      ok = true;
+    } catch { }
+    if (!ok) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond — nothing to fingerprint. 🔴</div>${crossLink(domain)}`;
+    else {
+      const gen = (H.match(/<meta[^>]+name=["']generator["'][^>]+content=["']([^"']+)/i) || [])[1] || "";
+      const powered = hdr["x-powered-by"] || "", server = hdr["server"] || "", cookie = hdr["set-cookie"] || "";
+      const found = {};
+      const add = (cat, name) => (found[cat] = found[cat] || new Set()).add(name);
+      if (/wp-content|wp-includes|wp-json/i.test(H) || /wordpress/i.test(gen)) add("CMS", "WordPress");
+      if (/woocommerce/i.test(H)) add("E-commerce", "WooCommerce");
+      if (/cdn\.shopify\.com|Shopify\.theme/i.test(H) || hdr["x-shopify-stage"] || hdr["x-shopid"]) add("E-commerce", "Shopify");
+      if (/static\.wixstatic\.com|wix\.com\//i.test(H) || hdr["x-wix-request-id"]) add("Site builder", "Wix");
+      if (/squarespace/i.test(H) || /squarespace/i.test(hdr["x-servedby"] || "")) add("Site builder", "Squarespace");
+      if (/assets\.website-files\.com|webflow\.io|Generated by Webflow/i.test(H)) add("Site builder", "Webflow");
+      if (/drupal/i.test(gen) || /Drupal\.settings|\/sites\/default\/files/i.test(H) || /drupal/i.test(hdr["x-generator"] || "")) add("CMS", "Drupal");
+      if (/joomla/i.test(gen) || /\/media\/jui\//i.test(H)) add("CMS", "Joomla");
+      if (/ghost/i.test(gen) || /content=["']Ghost/i.test(H)) add("CMS", "Ghost");
+      if (/Mage\.|\/static\/version\d|Magento/i.test(H)) add("E-commerce", "Magento");
+      if (/__NEXT_DATA__|\/_next\//i.test(H) || /next\.js/i.test(powered)) add("Framework", "Next.js");
+      if (/__NUXT__|\/_nuxt\//i.test(H)) add("Framework", "Nuxt");
+      if (/ng-version=|angular\.js/i.test(H)) add("Framework", "Angular");
+      if (/data-reactroot|react-dom|_reactListening/i.test(H)) add("Framework", "React");
+      if (/data-v-app|__VUE__|vue\.runtime/i.test(H)) add("Framework", "Vue");
+      if (/__SVELTEKIT|svelte-/i.test(H)) add("Framework", "Svelte");
+      if (/gatsby/i.test(H)) add("Framework", "Gatsby");
+      if (/express/i.test(powered)) add("Framework", "Express");
+      if (/nginx/i.test(server)) add("Server", "nginx");
+      if (/apache/i.test(server)) add("Server", "Apache");
+      if (/litespeed/i.test(server)) add("Server", "LiteSpeed");
+      if (/microsoft-iis/i.test(server)) add("Server", "IIS");
+      if (/php/i.test(powered) || /PHPSESSID/i.test(cookie)) add("Language", "PHP");
+      if (/asp\.net/i.test(powered) || /ASP\.NET_SessionId/i.test(cookie)) add("Language", "ASP.NET");
+      if (/googletagmanager\.com|gtag\(|google-analytics\.com/i.test(H)) add("Analytics", "Google Analytics / GTM");
+      if (/plausible\.io/i.test(H)) add("Analytics", "Plausible");
+      if (/static\.hotjar\.com/i.test(H)) add("Analytics", "Hotjar");
+      if (/connect\.facebook\.net\/.*fbevents/i.test(H)) add("Analytics", "Meta Pixel");
+      if (hdr["cf-ray"] || /cloudflare/i.test(server)) add("CDN", "Cloudflare");
+      if (/fastly/i.test(hdr["x-served-by"] || "") || /fastly/i.test(hdr["x-cache"] || "")) add("CDN", "Fastly");
+      if (hdr["x-amz-cf-id"]) add("CDN", "Amazon CloudFront");
+      if (gen && !Object.keys(found).length) add("Generator", gen.slice(0, 40));
+
+      const cats = Object.keys(found);
+      if (!cats.length) result = `<div class="verdict note"><b>${esc(domain)}</b> — no recognisable technologies detected. 🟡</div>
+        <p class="muted small">It may be custom-built, static, or deliberately hiding its stack.</p>${crossLink(domain)}`;
+      else {
+        const rows = cats.map(c => `<div class="row"><span>${esc(c)}</span><b>${[...found[c]].map(t => `<span class="tag">${esc(t)}</span>`).join(" ")}</b></div>`).join("");
+        const total = cats.reduce((n, c) => n + found[c].size, 0);
+        result = `<div class="verdict ok"><b>${esc(domain)}</b> — detected ${total} technolog${total === 1 ? "y" : "ies"}. 🔎</div>
+          <div class="card">${rows}</div>${crossLink(domain)}`;
+      }
+    }
+  }
+  return toolShell({
+    title: domain ? `${domain} tech stack — what's it built with? · HostCop` : "Tech stack detector · HostCop",
+    desc: domain ? `What is ${domain} built with? CMS, framework, server, analytics and CDN detected.` : "Detect the technologies behind any website — CMS, framework, server, analytics and CDN.",
+    path: domain ? "/tech/" + domain : "/tech", base: "/tech", domain, result,
+    h1: domain ? `${esc(domain)} — tech stack` : "Tech stack detector",
+    intro: "What is a website built with? Detect its CMS, framework, server, analytics and CDN from the page and headers.",
+    faq: `<h2>How it works</h2><p>HostCop fingerprints the technologies from the page's HTML and HTTP headers — the same signatures tools like Wappalyzer use. Detection is best-effort: sites can hide or proxy these signals, so a blank result doesn't always mean nothing's there.</p>` });
+}
+
 // ========================================================================
 // ROUTES: content pages
 // ========================================================================
@@ -1669,7 +1796,7 @@ function robots() {
 
 async function sitemap(env) {
   const staticUrls = ["/", "/hosts", "/compare", "/monitor", "/bulk", "/api",
-    "/tools", "/down", "/ssl", "/dns", "/redirect", "/dns-propagation", "/email", "/headers", "/reverse-ip",
+    "/tools", "/down", "/ssl", "/dns", "/redirect", "/dns-propagation", "/email", "/headers", "/reverse-ip", "/whois", "/tech",
     "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
     ...Object.keys(GUIDES).map(s => "/guides/" + s)];
   let providerUrls = [], compareUrls = [];
