@@ -27,3 +27,19 @@ CREATE TABLE IF NOT EXISTS domains (
   added_at     INTEGER NOT NULL,
   last_checked INTEGER
 );
+
+-- Uptime / SSL monitors — people who asked to be emailed about a domain.
+CREATE TABLE IF NOT EXISTS monitors (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain       TEXT NOT NULL,
+  email        TEXT NOT NULL,
+  status       TEXT,                 -- last seen: up | down | unknown
+  ssl_alerted  INTEGER DEFAULT 0,    -- 1 = we've already emailed about this cert expiring
+  token        TEXT NOT NULL,        -- verify + unsubscribe token
+  verified     INTEGER DEFAULT 0,    -- only verified monitors get alerts (anti-abuse)
+  created_at   INTEGER NOT NULL,
+  last_change  INTEGER,
+  UNIQUE(domain, email)
+);
+CREATE INDEX IF NOT EXISTS idx_monitors_domain ON monitors(domain);
+CREATE INDEX IF NOT EXISTS idx_monitors_token  ON monitors(token);

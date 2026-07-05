@@ -33,6 +33,9 @@ export default {
       if (p === "/bulk")         return handleBulk();
       if (p === "/compare")      return handleCompare(url, env, null);
       if (p.startsWith("/compare/")) return handleCompare(url, env, decodeURIComponent(p.slice(9)));
+      if (p === "/monitor")      return request.method === "POST" ? handleMonitorCreate(request, env) : pageMonitor(url);
+      if (p === "/monitor/verify")      return handleMonitorVerify(url, env);
+      if (p === "/monitor/unsubscribe") return handleMonitorUnsub(url, env);
       if (p === "/methodology")  return pageMethodology();
       if (p === "/about")        return pageAbout();
       if (p === "/guides")       return pageGuidesIndex();
@@ -49,6 +52,7 @@ export default {
 
   // Cron: re-ping tracked domains so rankings stay live.
   async scheduled(event, env, ctx) {
+    ctx.waitUntil(runMonitors(env));                 // uptime/SSL email alerts
     const { results } = await env.DB.prepare(
       "SELECT domain FROM domains ORDER BY last_checked ASC LIMIT 50"
     ).all();
@@ -628,8 +632,9 @@ async function handleCheck(domain, request, env) {
     ${investigation}
 
     <div class="actions">
-      <a class="btn" href="/host/${encodeURIComponent(res.provider)}">See ${esc(res.provider)}'s ranking →</a>
-      <a class="btn ghost" href="/hosts">Compare all hosts</a>
+      <a class="btn" href="/monitor?domain=${encodeURIComponent(res.domain)}">🔔 Monitor this site — free</a>
+      <a class="btn ghost" href="/host/${encodeURIComponent(res.brand)}">${esc(res.brand)} ranking →</a>
+      <a class="btn ghost" href="/hosts">Compare hosts</a>
     </div>
 
     <details class="share">
@@ -932,6 +937,155 @@ function pageApi() {
      <p class="muted">Need higher volume, bulk, or monitoring? That's the planned paid tier — <a href="/contact">tell us what you need</a>.</p>`);
 }
 
+// ---- uptime / SSL monitoring --------------------------------------------
+
+// hostcop.com isn't verified in Resend yet, so we send from the verified
+// fluxleads.com domain with a HostCop display name. Switch to @hostcop.com
+// once that domain is verified in Resend.
+const ALERT_FROM = "HostCop Alerts <alerts@fluxleads.com>";
+
+async function sendEmail(env, to, subject, htmlBody) {
+  if (!env.RESEND_API_KEY) return { ok: false, error: "email not configured" };
+  const r = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { authorization: `Bearer ${env.RESEND_API_KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ from: ALERT_FROM, to: [to], reply_to: "hello@hostcop.com", subject, html: htmlBody }),
+  });
+  const j = await r.json().catch(() => ({}));
+  return { ok: r.ok, status: r.status, id: j.id, error: j.message || j.name };
+}
+
+function emailShell(inner, token) {
+  return `<div style="font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:520px;margin:0 auto;color:#0f172a;line-height:1.6">
+    <div style="font-size:20px;font-weight:800;margin-bottom:14px">🛡 Host<span style="color:#f5b301">Cop</span></div>
+    ${inner}
+    <hr style="border:0;border-top:1px solid #e2e8f0;margin:22px 0">
+    <p style="font-size:12px;color:#94a3b8">You're receiving this because you asked HostCop to watch this domain.
+    ${token ? `<a href="${BASE}/monitor/unsubscribe?token=${token}" style="color:#94a3b8">Unsubscribe</a>` : ""}</p>
+  </div>`;
+}
+const emailBtn = (href, label) =>
+  `<p><a href="${href}" style="display:inline-block;background:#2563eb;color:#fff;padding:11px 20px;border-radius:8px;text-decoration:none;font-weight:600">${label}</a></p>`;
+
+function monitorForm(domain, email) {
+  return `<form class="monitorform" action="/monitor" method="post">
+    <input name="domain" placeholder="yourdomain.com" value="${esc(domain)}" autocomplete="off" spellcheck="false">
+    <input name="email" type="email" placeholder="you@email.com" value="${esc(email)}" autocomplete="off">
+    <button>Monitor it</button></form>`;
+}
+
+function pageMonitor(url) {
+  const domain = cleanDomain(url.searchParams.get("domain") || "");
+  return html(layout({
+    title: "Free uptime & SSL monitoring · HostCop",
+    desc: "Get a free email the moment your site goes down or its SSL certificate is about to expire. No account needed, one-click unsubscribe.",
+    path: "/monitor",
+    body: `<h1>Monitor a site — free</h1>
+      <p class="lede" style="margin:10px 0 20px">We check it around the clock and email you the instant it goes down, comes back, or its SSL certificate is within 14 days of expiring.</p>
+      ${monitorForm(domain, "")}
+      <div class="grid" style="margin-top:26px">
+        <div class="feat"><b>🔴 Downtime alerts</b><span>Know before your visitors do.</span></div>
+        <div class="feat"><b>🔒 SSL expiry alerts</b><span>Never get caught by a lapsed certificate again.</span></div>
+        <div class="feat"><b>✉️ No account</b><span>Just your email. One-click unsubscribe in every message.</span></div>
+        <div class="feat"><b>🛡 Neutral</b><span>No upsells, no affiliate host pushed on you.</span></div>
+      </div>
+      <p class="muted small" style="margin-top:16px">We send a confirmation email first, so nobody can sign you up without consent.</p>` }));
+}
+
+async function handleMonitorCreate(request, env) {
+  const form = await request.formData();
+  const domain = cleanDomain(form.get("domain") || "");
+  const email = (form.get("email") || "").trim().toLowerCase();
+  if (!domain || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
+    return html(layout({ title: "Monitor · HostCop", desc: "", path: "/monitor",
+      body: `<h1>Monitor a site</h1><p class="note">Please enter a valid domain and email address.</p>${monitorForm(domain, email)}` }), 400);
+
+  const token = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO monitors (domain, email, status, token, verified, created_at)
+     VALUES (?,?,?,?,0,?)
+     ON CONFLICT(domain, email) DO UPDATE SET token=excluded.token, verified=0`
+  ).bind(domain, email, "unknown", token, Date.now()).run();
+
+  const r = await sendEmail(env, email, `Confirm monitoring for ${domain}`, emailShell(
+    `<h2 style="margin:0 0 10px">Confirm alerts for ${esc(domain)}</h2>
+     <p>Click below to start getting an email whenever <b>${esc(domain)}</b> goes down or its SSL certificate is about to expire.</p>
+     ${emailBtn(`${BASE}/monitor/verify?token=${token}`, "Confirm monitoring")}
+     <p style="font-size:12px;color:#94a3b8">If you didn't request this, just ignore this email — nothing will be sent.</p>`, token));
+
+  return html(layout({ title: "Check your email · HostCop", desc: "", path: "/monitor",
+    body: `<h1>Almost there ✉️</h1>
+      <p>We sent a confirmation link to <b>${esc(email)}</b>. Click it to start monitoring <b>${esc(domain)}</b>.</p>
+      ${r.ok ? "" : `<p class="note">The email couldn't be sent right now${r.error ? ` (${esc(r.error)})` : ""}. Please try again shortly.</p>`}
+      <p class="muted small">No email in a minute? Check spam, or <a href="/monitor?domain=${encodeURIComponent(domain)}">re-send</a>.</p>` }));
+}
+
+async function handleMonitorVerify(url, env) {
+  const token = url.searchParams.get("token") || "";
+  const m = token ? await env.DB.prepare("SELECT * FROM monitors WHERE token=?").bind(token).first() : null;
+  if (!m) return html(layout({ title: "Link invalid · HostCop", desc: "", path: "/monitor",
+    body: `<h1>Link invalid or expired</h1><p><a href="/monitor">Set up monitoring again →</a></p>` }), 404);
+  await env.DB.prepare("UPDATE monitors SET verified=1 WHERE id=?").bind(m.id).run();
+  return html(layout({ title: "Monitoring active · HostCop", desc: "", path: "/monitor",
+    body: `<div class="verdict ok"><b>${esc(m.domain)}</b> is now being monitored. ✅</div>
+      <p>We'll email <b>${esc(m.email)}</b> the moment it goes down or recovers, and when its SSL certificate is within 14 days of expiring.</p>
+      <p><a class="btn" href="/check/${esc(m.domain)}">See its current status →</a></p>` }));
+}
+
+async function handleMonitorUnsub(url, env) {
+  const token = url.searchParams.get("token") || "";
+  const m = token ? await env.DB.prepare("SELECT * FROM monitors WHERE token=?").bind(token).first() : null;
+  if (m) await env.DB.prepare("DELETE FROM monitors WHERE id=?").bind(m.id).run();
+  return html(layout({ title: "Unsubscribed · HostCop", desc: "", path: "/monitor",
+    body: `<h1>Unsubscribed</h1><p>${m ? `You'll no longer get alerts for <b>${esc(m.domain)}</b>.` : "That link is no longer valid."}</p>` }));
+}
+
+// Cron worker: check each monitored domain, email on up/down transitions + SSL expiry.
+async function runMonitors(env) {
+  const { results: doms } = await env.DB.prepare(
+    "SELECT DISTINCT domain FROM monitors WHERE verified=1").all();
+  for (const { domain } of doms) {
+    let res = await runCheck(domain, "monitor", env);
+    if (!res) continue;
+    let isUp = res.noDns ? false : !!res.up;
+    if (!isUp) {                                   // confirm down with a 2nd check (single-region safety)
+      const res2 = await runCheck(domain, "monitor", env);
+      if (res2) { res = res2; isUp = !res2.noDns && !!res2.up; }
+    }
+    const cur = isUp ? "up" : "down";
+    const { results: subs } = await env.DB.prepare(
+      "SELECT * FROM monitors WHERE domain=? AND verified=1").bind(domain).all();
+
+    for (const m of subs) {
+      const prev = m.status || "unknown";
+      if (prev !== "unknown" && prev !== cur) {
+        const subj = cur === "down" ? `🔴 ${domain} is DOWN` : `✅ ${domain} is back UP`;
+        const inner = cur === "down"
+          ? `<h2 style="margin:0 0 10px">${esc(domain)} appears to be down</h2>
+             <p>HostCop couldn't reach it just now — ${res.noDns ? "its DNS stopped resolving" : "the server didn't respond"}.</p>`
+          : `<h2 style="margin:0 0 10px">${esc(domain)} is back online</h2>
+             <p>It's responding again${res.ms ? ` (${res.ms} ms)` : ""}.</p>`;
+        await sendEmail(env, m.email, subj, emailShell(inner + emailBtn(`${BASE}/check/${domain}`, "See full status"), m.token));
+      }
+      if (prev !== cur) await env.DB.prepare(
+        "UPDATE monitors SET status=?, last_change=? WHERE id=?").bind(cur, Date.now(), m.id).run();
+
+      if (res.sslExpiry) {
+        const days = Math.round((res.sslExpiry - Date.now()) / 86400000);
+        if (days >= 0 && days <= 14 && !m.ssl_alerted) {
+          await sendEmail(env, m.email, `🔒 ${domain} SSL expires in ${days} day${days === 1 ? "" : "s"}`, emailShell(
+            `<h2 style="margin:0 0 10px">${esc(domain)}'s SSL certificate expires in ${days} day${days === 1 ? "" : "s"}</h2>
+             <p>Renew it before it lapses, or visitors will hit a security warning.</p>` +
+            emailBtn(`${BASE}/check/${domain}`, "See details"), m.token));
+          await env.DB.prepare("UPDATE monitors SET ssl_alerted=1 WHERE id=?").bind(m.id).run();
+        } else if (days > 21 && m.ssl_alerted) {
+          await env.DB.prepare("UPDATE monitors SET ssl_alerted=0 WHERE id=?").bind(m.id).run();  // renewed
+        }
+      }
+    }
+  }
+}
+
 // ========================================================================
 // ROUTES: content pages
 // ========================================================================
@@ -1203,7 +1357,7 @@ function robots() {
 }
 
 async function sitemap(env) {
-  const staticUrls = ["/", "/hosts", "/compare", "/bulk", "/api", "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
+  const staticUrls = ["/", "/hosts", "/compare", "/monitor", "/bulk", "/api", "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
     ...Object.keys(GUIDES).map(s => "/guides/" + s)];
   let providerUrls = [], compareUrls = [];
   try {
@@ -1294,7 +1448,7 @@ function layout({ title, desc, path, body, home }) {
 <footer>
   <div class="fcols">
     <div><b>HostCop</b><p class="muted">Neutral hosting watchdog. Measured data, never fake reviews. <b>No affiliate links.</b></p></div>
-    <div><a href="/hosts">Rankings</a><a href="/compare">Compare</a><a href="/bulk">Bulk check</a><a href="/api">API</a><a href="/guides">Guides</a></div>
+    <div><a href="/hosts">Rankings</a><a href="/compare">Compare</a><a href="/monitor">Monitor</a><a href="/bulk">Bulk check</a><a href="/api">API</a><a href="/guides">Guides</a></div>
     <div><a href="/methodology">Methodology</a><a href="/about">About</a><a href="/contact">Contact</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div>
   </div>
   <p class="muted small">© 2026 HostCop · Built on Cloudflare. Data is measured live and provided as-is.</p>
@@ -1430,6 +1584,8 @@ textarea{width:100%;padding:12px 14px;border:1px solid var(--border);border-radi
 textarea:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px var(--glow)}
 select{padding:11px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--fg);font-size:.95rem;max-width:46%}
 .compareform{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:16px 0}
+.monitorform{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0;max-width:560px}
+.monitorform input{flex:1;min-width:180px}
 .cmp{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0}
 .cmp .col{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px}
 .cmp .col h3{margin:.1em 0 .6em;font-size:1.05rem;text-align:center}
