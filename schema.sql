@@ -43,3 +43,14 @@ CREATE TABLE IF NOT EXISTS monitors (
 );
 CREATE INDEX IF NOT EXISTS idx_monitors_domain ON monitors(domain);
 CREATE INDEX IF NOT EXISTS idx_monitors_token  ON monitors(token);
+
+-- Paid plans, keyed by email (same identity as monitors). No accounts needed.
+CREATE TABLE IF NOT EXISTS subscriptions (
+  email           TEXT PRIMARY KEY,
+  plan            TEXT NOT NULL DEFAULT 'free',   -- free | pro
+  status          TEXT DEFAULT 'active',          -- active | canceled | past_due
+  stripe_customer TEXT,
+  stripe_sub      TEXT,
+  updated         INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_subs_customer ON subscriptions(stripe_customer);

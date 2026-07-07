@@ -43,6 +43,10 @@ export default {
       if (p === "/monitor")      return request.method === "POST" ? handleMonitorCreate(request, env) : pageMonitor(url);
       if (p === "/monitor/verify")      return handleMonitorVerify(url, env);
       if (p === "/monitor/unsubscribe") return handleMonitorUnsub(url, env);
+      if (p === "/pricing")      return pagePricing(url, env);
+      if (p === "/upgrade")      return handleUpgrade(request, env, url);
+      if (p === "/pro/welcome")  return pageProWelcome(url);
+      if (p === "/stripe/webhook") return handleStripeWebhook(request, env);
       if (p === "/tools")        return pageTools();
       if (p === "/down" || p.startsWith("/down/"))       return toolDown(toolDomain(url, p, "/down"), env);
       if (p === "/ssl" || p.startsWith("/ssl/"))         return toolSsl(toolDomain(url, p, "/ssl"));
@@ -70,9 +74,13 @@ export default {
     }
   },
 
-  // Cron: re-ping tracked domains so rankings stay live.
+  // Cron: */5 = Pro monitors (frequent); */30 = free+pro monitors + rankings sweep.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runMonitors(env));                 // uptime/SSL email alerts
+    if (event.cron === "*/5 * * * *") {
+      ctx.waitUntil(runMonitors(env, "pro"));
+      return;
+    }
+    ctx.waitUntil(runMonitors(env, "all"));          // uptime/SSL email alerts
     const { results } = await env.DB.prepare(
       "SELECT domain FROM domains ORDER BY last_checked ASC LIMIT 50"
     ).all();
@@ -1075,6 +1083,19 @@ async function handleMonitorCreate(request, env) {
     return html(layout({ title: "Monitor · HostCop", desc: "", path: "/monitor",
       body: `<h1>Monitor a site</h1><p class="note">Please enter a valid domain and email address.</p>${monitorForm(domain, email)}` }), 400);
 
+  // Plan limit — how many sites this email may watch.
+  const plan = await getPlan(env, email);
+  const limit = PLANS[plan].monitors;
+  const existing = await env.DB.prepare("SELECT id FROM monitors WHERE domain=? AND email=?").bind(domain, email).first();
+  if (!existing) {
+    const cnt = await env.DB.prepare("SELECT COUNT(*) c FROM monitors WHERE email=?").bind(email).first();
+    if ((cnt?.c || 0) >= limit)
+      return html(layout({ title: "Monitor limit reached · HostCop", desc: "", path: "/monitor",
+        body: `<h1>You're already watching ${limit} sites</h1>
+          <p class="note">Your ${PLANS[plan].label} plan covers up to <b>${limit}</b> monitored sites.${plan === "free" ? ` Upgrade to Pro to watch up to ${PLANS.pro.monitors} sites, checked every 5 minutes.` : ""}</p>
+          <p><a class="btn" href="/pricing">See plans →</a></p>` }));
+  }
+
   const token = crypto.randomUUID();
   await env.DB.prepare(
     `INSERT INTO monitors (domain, email, status, token, verified, created_at)
@@ -1116,9 +1137,11 @@ async function handleMonitorUnsub(url, env) {
 }
 
 // Cron worker: check each monitored domain, email on up/down transitions + SSL expiry.
-async function runMonitors(env) {
+async function runMonitors(env, scope = "all") {
+  const proOnly = `SELECT DISTINCT m.domain FROM monitors m WHERE m.verified=1 AND EXISTS
+    (SELECT 1 FROM subscriptions s WHERE s.email=m.email AND s.plan='pro' AND s.status='active')`;
   const { results: doms } = await env.DB.prepare(
-    "SELECT DISTINCT domain FROM monitors WHERE verified=1").all();
+    scope === "pro" ? proOnly : "SELECT DISTINCT domain FROM monitors WHERE verified=1").all();
   for (const { domain } of doms) {
     let res = await runCheck(domain, "monitor", env);
     if (!res) continue;
@@ -1160,6 +1183,139 @@ async function runMonitors(env) {
       }
     }
   }
+}
+
+// ---- plans & billing (Stripe) -------------------------------------------
+
+const PLANS = {
+  free: { label: "Free", monitors: 3, freq: "every 30 min" },
+  pro: { label: "Pro", monitors: 50, freq: "every 5 min" },
+};
+const PRO_PRICE = "$7";        // per month — change here + in Stripe
+
+async function getPlan(env, email) {
+  if (!email) return "free";
+  const r = await env.DB.prepare("SELECT plan, status FROM subscriptions WHERE email=?").bind(email).first();
+  return r && r.plan === "pro" && r.status === "active" ? "pro" : "free";
+}
+
+async function upsertSub(env, email, plan, status, customer, sub) {
+  if (!email) return;
+  await env.DB.prepare(
+    `INSERT INTO subscriptions (email, plan, status, stripe_customer, stripe_sub, updated)
+     VALUES (?,?,?,?,?,?)
+     ON CONFLICT(email) DO UPDATE SET plan=excluded.plan, status=excluded.status,
+       stripe_customer=COALESCE(excluded.stripe_customer, subscriptions.stripe_customer),
+       stripe_sub=COALESCE(excluded.stripe_sub, subscriptions.stripe_sub), updated=excluded.updated`
+  ).bind(email.toLowerCase(), plan, status, customer || null, sub || null, Date.now()).run();
+}
+
+// Verify Stripe's webhook signature (HMAC-SHA256 over "timestamp.payload").
+async function verifyStripe(payload, header, secret) {
+  if (!header || !secret) return false;
+  const parts = Object.fromEntries(header.split(",").map(kv => kv.split("=")));
+  if (!parts.t || !parts.v1) return false;
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${parts.t}.${payload}`));
+  const hex = [...new Uint8Array(mac)].map(b => b.toString(16).padStart(2, "0")).join("");
+  return hex === parts.v1;
+}
+
+const billingLive = env => !!(env.STRIPE_SECRET_KEY && env.STRIPE_PRICE);
+
+async function handleUpgrade(request, env, url) {
+  const email = ((request.method === "POST"
+    ? (await request.formData()).get("email")
+    : url.searchParams.get("email")) || "").trim().toLowerCase();
+  if (!billingLive(env)) return Response.redirect(`${BASE}/pricing?soon=1`, 303);
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return Response.redirect(`${BASE}/pricing?bad=1`, 303);
+  const body = new URLSearchParams();
+  body.set("mode", "subscription");
+  body.set("line_items[0][price]", env.STRIPE_PRICE);
+  body.set("line_items[0][quantity]", "1");
+  body.set("customer_email", email);
+  body.set("success_url", `${BASE}/pro/welcome?email=${encodeURIComponent(email)}`);
+  body.set("cancel_url", `${BASE}/pricing`);
+  const r = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${env.STRIPE_SECRET_KEY}`, "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  const j = await r.json();
+  return j.url ? Response.redirect(j.url, 303) : Response.redirect(`${BASE}/pricing?err=1`, 303);
+}
+
+async function handleStripeWebhook(request, env) {
+  const payload = await request.text();
+  const ok = await verifyStripe(payload, request.headers.get("stripe-signature"), env.STRIPE_WEBHOOK_SECRET);
+  if (!ok) return new Response("bad signature", { status: 400 });
+  let event; try { event = JSON.parse(payload); } catch { return new Response("bad json", { status: 400 }); }
+  const obj = event.data?.object || {};
+  if (event.type === "checkout.session.completed") {
+    const email = obj.customer_email || obj.customer_details?.email;
+    await upsertSub(env, email, "pro", "active", obj.customer, obj.subscription);
+  } else if (event.type.startsWith("customer.subscription.")) {
+    const plan = (obj.status === "active" || obj.status === "trialing") ? "pro" : "free";
+    await env.DB.prepare("UPDATE subscriptions SET plan=?, status=?, updated=? WHERE stripe_customer=?")
+      .bind(plan, obj.status || "canceled", Date.now(), obj.customer).run();
+  }
+  return new Response("ok");
+}
+
+function pagePricing(url, env) {
+  const soon = url.searchParams.get("soon"), bad = url.searchParams.get("bad"), err = url.searchParams.get("err");
+  const live = billingLive(env);
+  const notice = soon ? `<p class="note">Pro is launching very soon — <a href="/contact">tell us you're interested</a> and we'll let you know.</p>`
+    : bad ? `<p class="note">Please enter a valid email.</p>`
+    : err ? `<p class="note">Couldn't start checkout — please try again.</p>` : "";
+  const cta = live
+    ? `<form class="monitorform" action="/upgrade" method="post" style="margin-top:12px">
+         <input name="email" type="email" placeholder="you@email.com" required>
+         <button>Upgrade to Pro — ${PRO_PRICE}/mo</button></form>`
+    : `<a class="btn" href="/pricing?soon=1" style="margin-top:12px">Get notified when Pro launches</a>`;
+  const feat = (ok, t) => `<div class="row"><span>${ok ? '<span class="up">✓</span>' : '<span class="muted">–</span>'} ${t}</span><b></b></div>`;
+  return html(layout({
+    title: "Pricing — free tools, Pro monitoring · HostCop",
+    desc: "HostCop's tools are free forever. Pro adds monitoring for up to 50 sites checked every 5 minutes. No affiliate links, ever.",
+    path: "/pricing",
+    body: `<h1>Pricing</h1>
+      <div class="trustbadge">🛡 All tools free forever · No affiliate links, ever</div>
+      ${notice}
+      <div class="cmp" style="margin-top:14px">
+        <div class="col">
+          <h3>Free</h3>
+          <p class="muted small" style="text-align:center;margin:0 0 8px">$0 — forever</p>
+          ${feat(true, "Every tool, unlimited")}
+          ${feat(true, "Full hosting reports")}
+          ${feat(true, `Monitor ${PLANS.free.monitors} sites`)}
+          ${feat(true, "Checked every 30 min")}
+          ${feat(true, "Downtime & SSL email alerts")}
+          ${feat(false, "5-minute checks")}
+          <a class="btn ghost" href="/monitor" style="margin-top:12px">Start monitoring free</a>
+        </div>
+        <div class="col" style="border-color:var(--brand)">
+          <h3>Pro <span class="tag">popular</span></h3>
+          <p class="muted small" style="text-align:center;margin:0 0 8px">${PRO_PRICE}/month</p>
+          ${feat(true, "Everything in Free")}
+          ${feat(true, `Monitor ${PLANS.pro.monitors} sites`)}
+          ${feat(true, "Checked every 5 min")}
+          ${feat(true, "Multi-region downtime checks")}
+          ${feat(true, "Priority email alerts")}
+          ${feat(true, "Support an independent, unbiased watchdog")}
+          ${cta}
+        </div>
+      </div>
+      <p class="muted small" style="margin-top:18px">Pro is billed monthly and cancels anytime. Your email is your account — the same one you monitor with. HostCop makes money from Pro, never from affiliate links, so the rankings stay honest.</p>` }));
+}
+
+function pageProWelcome(url) {
+  const email = cleanEmail(url.searchParams.get("email") || "");
+  return html(layout({
+    title: "Welcome to Pro · HostCop", desc: "", path: "/pro/welcome",
+    body: `<div class="verdict ok">You're on <b>HostCop Pro</b> now. 🎉</div>
+      <p>Thanks for backing an unbiased hosting watchdog. ${email ? `<b>${esc(email)}</b> can now monitor up to ${PLANS.pro.monitors} sites, checked every 5 minutes.` : `You can now monitor up to ${PLANS.pro.monitors} sites, checked every 5 minutes.`}</p>
+      <p><a class="btn" href="/monitor">Add a site to monitor →</a></p>` }));
 }
 
 // ---- free tools (each = its own SEO landing page) -----------------------
@@ -1958,7 +2114,7 @@ function robots() {
 }
 
 async function sitemap(env) {
-  const staticUrls = ["/", "/hosts", "/compare", "/monitor", "/bulk", "/api",
+  const staticUrls = ["/", "/hosts", "/compare", "/monitor", "/pricing", "/bulk", "/api",
     "/tools", "/down", "/ssl", "/dns", "/redirect", "/dns-propagation", "/email", "/headers", "/reverse-ip", "/whois", "/tech", "/speed",
     "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
     ...Object.keys(GUIDES).map(s => "/guides/" + s)];
@@ -2047,7 +2203,7 @@ function layout({ title, desc, path, body, home }) {
     <a href="/tools">Tools</a>
     <a href="/hosts">Rankings</a>
     <a href="/monitor">Monitor</a>
-    <a href="/guides">Guides</a>
+    <a href="/pricing">Pricing</a>
     <a href="/about">About</a>
     <button class="themebtn" onclick="hcToggle()" aria-label="Toggle dark mode" title="Toggle theme">◐</button>
   </nav>
@@ -2056,7 +2212,7 @@ function layout({ title, desc, path, body, home }) {
 <footer>
   <div class="fcols">
     <div><b>HostCop</b><p class="muted">Neutral hosting watchdog. Measured data, never fake reviews. <b>No affiliate links.</b></p></div>
-    <div><a href="/tools">Tools</a><a href="/hosts">Rankings</a><a href="/compare">Compare</a><a href="/monitor">Monitor</a><a href="/bulk">Bulk check</a><a href="/api">API</a><a href="/guides">Guides</a></div>
+    <div><a href="/tools">Tools</a><a href="/hosts">Rankings</a><a href="/compare">Compare</a><a href="/monitor">Monitor</a><a href="/pricing">Pricing</a><a href="/bulk">Bulk check</a><a href="/api">API</a><a href="/guides">Guides</a></div>
     <div><a href="/methodology">Methodology</a><a href="/about">About</a><a href="/contact">Contact</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></div>
   </div>
   <p class="muted small">© 2026 HostCop · Built on Cloudflare. Data is measured live and provided as-is.</p>
@@ -2234,6 +2390,11 @@ function cleanDomain(d) {
   d = (d || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
   return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d) ? d : "";
 }
+
+const cleanEmail = e => {
+  e = (e || "").trim().toLowerCase();
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e) ? e : "";
+};
 
 function timeAgo(ms) {
   if (!ms) return "—";

@@ -8,9 +8,9 @@ routes = [
   { pattern = "www.hostcop.com", custom_domain = true },
 ]
 
-# Re-check every monitored domain every 30 min so rankings stay live
+# */30 = full sweep + free monitors; */5 = frequent checks for Pro monitors
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["*/5 * * * *", "*/30 * * * *"]
 
 [[d1_databases]]
 binding = "DB"
