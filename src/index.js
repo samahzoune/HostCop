@@ -8,6 +8,10 @@ const BASE = "https://hostcop.com";
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/125.0 Safari/537.36";
 
+// The HostCop emblem (gold shield + magnifier) as a PNG, for email clients that
+// won't render SVG. Served at /logo.png. Matches the nav emblem and favicon.
+const LOGO_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAEgAAABICAYAAABV7bNHAAAC+0lEQVR42u3bPUzbUBAHcLsISguUqFRCbBFLFwYmWGFgYkFC6hwxsnVgJjNDp66tZ6RKDN5YMjNlZcvWNZNno7+VJ1lXO67te5+5k54CSEF5P7+592EniiQkJCQkJCQkJCR0RJbGx1kaj7M0njjW8JmObaEMFx9glqVx7nibLT7r0BRM4gFKXUu0QWVpPPIYhrYRN85VQDiqXXECPQUI9MQJNAkQaCJAPgK9/FzPx6Ot/OJ0t2gfd77kXw8/Fz/fXO7kv+4287+P71YP6M/9+/zkaFCANLWD/b0CSzOUG0DopBopbRugMKKCBUI6oZNdcMoNoyk4oNffa7U4qtYAUI2y54eN/Mfth6IeGUKyC1RVb5BqgGt6L/CqcJnTzR4QZqm+IwCjiyIDjbFw2wFCB+jV75oeVTWMMdXsANHRg5rS56ojrTSNIjtANC046gYt3Ey1yDwQriytPRzpgNlNQ5qZB8JUTWctDiBN/9c+0Pdv2yxAdGQi5bwEogUVBZtr3aIhde2PoOvzT2wnAEGkGO0IUyr8MzK9BUKjCzu13+rTMGtpSF07QEgrzikZezdafzjQrQHROoSGv3VNLbrwxO/eb1bpARnSru1VxxKh6tgDJ5PeA9FirZD+dyRVrciD2c3XbQ/KNWnZaEJa1R2aqRRzcbOacMw+dAmAgo4ZCenU5tyaCSnhBBpkaTzl2GhytZ5I6MuA+/58ZySkVNs7G6g3GF3LbhV1ROLH4UBSSwCk1bI7Heg0YFTH8cqIpA+HC6k8qgCGooxXtLqOMiHpxyFIRp8ua0Jq2BjPjOGQZxPnLiHVvG9u81lFZ5BQ15zCcQ2p4iDfPo5NJLXqxoxXsTJ3B6eEdObQw1Fnrj5U7sKTsKPI5bCM5DaOZSQ/cCwh+YVTQhobwBlHPofm73YkUQihCSkMHE1IYeEwI4WJU0Lqc5Y0jUKPHgduU+NnOh4hrQ5OB6TVw2mBtLo4JaRhzVnS3Mg3lT1Bogdu7h14OYQkOA1IgiMhISGxiDe3as830gEmQwAAAABJRU5ErkJggg==";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -24,6 +28,7 @@ export default {
       if (p === "/robots.txt")   return robots();
       if (p === "/sitemap.xml")  return sitemap(env);
       if (p === "/favicon.svg")  return favicon();
+      if (p === "/logo.png")     return logoPng();
       if (p === "/og.svg")       return ogImage();
       if (p === "/api/check")    return apiCheck(url, request, env);
       if (p === "/check")        return handleCheck(cleanDomain(url.searchParams.get("domain") || ""), request, env);
@@ -972,7 +977,10 @@ async function sendEmail(env, to, subject, htmlBody) {
 
 function emailShell(inner, token) {
   return `<div style="font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:520px;margin:0 auto;color:#0f172a;line-height:1.6">
-    <div style="font-size:20px;font-weight:800;margin-bottom:14px">🛡 Host<span style="color:#f5b301">Cop</span></div>
+    <div style="margin-bottom:16px">
+      <img src="${BASE}/logo.png" width="26" height="26" alt="HostCop" style="vertical-align:middle;border:0;margin-right:6px">
+      <span style="font-size:20px;font-weight:800;vertical-align:middle">Host<span style="color:#f5b301">Cop</span></span>
+    </div>
     ${inner}
     <hr style="border:0;border-top:1px solid #e2e8f0;margin:22px 0">
     <p style="font-size:12px;color:#94a3b8">You're receiving this because you asked HostCop to watch this domain.
@@ -1888,12 +1896,16 @@ async function sitemap(env) {
 }
 
 function favicon() {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <path d="M32 3 6 14v18c0 16 11 25 26 29 15-4 26-13 26-29V14L32 3Z" fill="#2563eb"/>
-  <path d="M32 3 6 14v18c0 16 11 25 26 29V3Z" fill="#1d4ed8"/>
-  <text x="32" y="42" font-family="system-ui,Arial" font-size="34" font-weight="800"
-        fill="#fff" text-anchor="middle">H</text></svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <path d="M12 2 4 5v6c0 5 3.4 8 8 9 4.6-1 8-4 8-9V5l-8-3Z" fill="#f5b301"/>
+  <circle cx="11.2" cy="10.2" r="2.4" fill="none" stroke="#0a0d14" stroke-width="1.7"/>
+  <path d="m13.1 12.1 2 2.2" stroke="#0a0d14" stroke-width="1.7" stroke-linecap="round" fill="none"/></svg>`;
   return new Response(svg, { headers: { "content-type": "image/svg+xml", "cache-control": "max-age=86400" } });
+}
+
+function logoPng() {
+  const bytes = Uint8Array.from(atob(LOGO_PNG_B64), c => c.charCodeAt(0));
+  return new Response(bytes, { headers: { "content-type": "image/png", "cache-control": "max-age=604800" } });
 }
 
 function ogImage() {
