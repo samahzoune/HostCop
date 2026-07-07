@@ -1341,9 +1341,33 @@ const toolDomain = (url, p, base) =>
 const crossLink = d =>
   `<div class="actions"><a class="btn" href="/check/${encodeURIComponent(d)}">🛡️ Full hosting report for ${esc(d)} →</a></div>`;
 
+// ---- structured data (JSON-LD) helpers ----------------------------------
+const stripTags = s => String(s || "").replace(/<[^>]+>/g, "")
+  .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"')
+  .replace(/\s+/g, " ").trim();
+
+function faqLd(faqHtml) {
+  const items = [];
+  const re = /<h2>([\s\S]*?)<\/h2>\s*<p>([\s\S]*?)<\/p>/g;
+  let m;
+  while ((m = re.exec(faqHtml || ""))) {
+    items.push({ "@type": "Question", name: stripTags(m[1]),
+      acceptedAnswer: { "@type": "Answer", text: stripTags(m[2]) } });
+  }
+  return items.length ? { "@context": "https://schema.org", "@type": "FAQPage", mainEntity: items } : null;
+}
+const breadcrumbLd = items => ({
+  "@context": "https://schema.org", "@type": "BreadcrumbList",
+  itemListElement: items.map((it, i) => ({ "@type": "ListItem", position: i + 1, name: it.name, item: BASE + it.url })),
+});
+
 function toolShell({ title, desc, path, h1, intro, base, domain, result, faq }) {
+  const jsonld = [
+    faqLd(faq),
+    breadcrumbLd([{ name: "Home", url: "/" }, { name: "Tools", url: "/tools" }, { name: stripTags(h1), url: base }]),
+  ];
   return html(layout({
-    title, desc, path, body: `
+    title, desc, path, jsonld, body: `
     <div class="kicker">HostCop tools</div>
     <h1>${h1}</h1>
     <p class="lede" style="max-width:640px;margin:8px 0 18px">${intro}</p>
@@ -1929,6 +1953,14 @@ async function handleHome(env) {
     title: "HostCop — who really hosts any website? Neutral, measured, no fake reviews",
     desc: "Paste a domain and HostCop detects the real hosting provider behind CDNs and resellers, then measures response time, uptime and SSL expiry live. Neutral host rankings from crowdsourced data — no reviews, no affiliate bias.",
     path: "/", body, home: true,
+    jsonld: [{
+      "@context": "https://schema.org", "@type": "WebSite", name: "HostCop", url: BASE + "/",
+      potentialAction: {
+        "@type": "SearchAction",
+        target: { "@type": "EntryPoint", urlTemplate: `${BASE}/check/{domain}` },
+        "query-input": "required name=domain",
+      },
+    }],
   }));
 }
 
@@ -2050,12 +2082,19 @@ function pageGuidesIndex() {
 function pageGuide(slug) {
   const g = GUIDES[slug];
   if (!g) return notFound();
+  const jsonld = [
+    { "@context": "https://schema.org", "@type": "Article", headline: g.title, description: g.desc,
+      datePublished: g.date, dateModified: g.date, url: `${BASE}/guides/${slug}`,
+      author: { "@type": "Organization", name: "HostCop" },
+      publisher: { "@type": "Organization", name: "HostCop", logo: { "@type": "ImageObject", url: `${BASE}/logo.png` } } },
+    breadcrumbLd([{ name: "Home", url: "/" }, { name: "Guides", url: "/guides" }, { name: g.title, url: "/guides/" + slug }]),
+  ];
   return contentPage(g.title, "/guides/" + slug, g.desc,
     `<a class="back" href="/guides">← all guides</a>
      <h1>${esc(g.title)}</h1>
      <p class="muted">Guide · updated ${g.date}</p>
      ${g.body}
-     <p class="cta"><a class="btn" href="/">Check a domain now →</a></p>`);
+     <p class="cta"><a class="btn" href="/">Check a domain now →</a></p>`, jsonld);
 }
 
 function pagePrivacy() {
@@ -2100,8 +2139,8 @@ function pageContact() {
 }
 
 // Shared content-page wrapper
-function contentPage(title, path, desc, inner) {
-  return html(layout({ title: `${title} · HostCop`, desc, path, body: `<article class="prose">${inner}</article>` }));
+function contentPage(title, path, desc, inner, jsonld) {
+  return html(layout({ title: `${title} · HostCop`, desc, path, jsonld, body: `<article class="prose">${inner}</article>` }));
 }
 
 // ========================================================================
@@ -2118,15 +2157,19 @@ async function sitemap(env) {
     "/tools", "/down", "/ssl", "/dns", "/redirect", "/dns-propagation", "/email", "/headers", "/reverse-ip", "/whois", "/tech", "/speed",
     "/guides", "/methodology", "/about", "/privacy", "/terms", "/contact",
     ...Object.keys(GUIDES).map(s => "/guides/" + s)];
-  let providerUrls = [], compareUrls = [];
+  let providerUrls = [], compareUrls = [], domainUrls = [];
   try {
     const top = await topProviders(env, 200);
     providerUrls = top.map(p => "/host/" + encodeURIComponent(p));
     // Seed a batch of comparison pages between the most-tested hosts for SEO.
     for (let i = 0; i + 1 < Math.min(top.length, 24); i += 2)
       compareUrls.push(`/compare/${provSlug(top[i])}-vs-${provSlug(top[i + 1])}`);
+    // Every checked domain gets its "who hosts X" report page indexed.
+    const { results } = await env.DB.prepare(
+      "SELECT domain FROM checks WHERE brand IS NOT NULL AND brand!='Unknown' GROUP BY domain ORDER BY MAX(checked_at) DESC LIMIT 1000").all();
+    domainUrls = results.map(r => "/check/" + encodeURIComponent(r.domain));
   } catch {}
-  const urls = [...staticUrls, ...providerUrls, ...compareUrls]
+  const urls = [...staticUrls, ...providerUrls, ...compareUrls, ...domainUrls]
     .map(u => `<url><loc>${BASE}${u}</loc></url>`).join("");
   return new Response(`<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls}</urlset>`,
@@ -2168,9 +2211,16 @@ function notFound() {
 // LAYOUT
 // ========================================================================
 
-function layout({ title, desc, path, body, home }) {
+function layout({ title, desc, path, body, home, jsonld }) {
   const canonical = BASE + (path === "/" ? "" : path);
   const d = desc || "HostCop — the neutral hosting watchdog. Detect the real host behind any domain and measure its performance.";
+  const blocks = [
+    { "@context": "https://schema.org", "@type": "Organization", name: "HostCop", url: BASE + "/",
+      logo: `${BASE}/logo.png`, description: "Neutral web-hosting watchdog: detect the real host behind any domain, measure performance, and rank hosts by crowdsourced data." },
+    ...(jsonld || []).filter(Boolean),
+  ];
+  const ld = blocks.map(b =>
+    `<script type="application/ld+json">${JSON.stringify(b).replace(/</g, "\\u003c")}</script>`).join("");
   return `<!doctype html><html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2193,6 +2243,7 @@ function layout({ title, desc, path, body, home }) {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
+${ld}
 <style>${CSS}</style>
 </head><body>
 <div id="overlay"><div class="spin"></div><p id="ovmsg"></p></div>
