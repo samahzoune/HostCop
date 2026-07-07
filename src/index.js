@@ -1208,7 +1208,7 @@ async function toolDns(domain) {
   if (domain) {
     const types = ["A", "AAAA", "MX", "TXT", "NS", "CNAME"];
     const all = await Promise.all(types.map(t => dohAll(domain, t)));
-    const rows = types.map((t, i) => `<div class="row"><span>${t}</span><b>${all[i].length ? all[i].map(esc).join("<br>") : '<span class="muted">—</span>'}</b></div>`).join("");
+    const rows = types.map((t, i) => `<div class="row"><span>${t}</span><b>${all[i].length ? all[i].map(x => esc(x.replace(/^"|"$/g, ""))).join("<br>") : '<span class="muted">—</span>'}</b></div>`).join("");
     result = `<div class="card">${rows}</div>${crossLink(domain)}`;
   }
   return toolShell({
@@ -1331,15 +1331,8 @@ async function toolEmail(domain) {
 async function toolHeaders(domain) {
   let result = "";
   if (domain) {
-    let headers = null;
-    try {
-      const r = await fetch(`https://${domain}/`, {
-        redirect: "follow", signal: AbortSignal.timeout(8000),
-        headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36" },
-      });
-      headers = r.headers;
-    } catch { }
-    if (!headers) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond — no headers to read. 🔴</div>${crossLink(domain)}`;
+    const doc = await fetchDoc(`https://${domain}/`, 0);
+    if (!doc.ok) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond — no headers to read. 🔴</div>${crossLink(domain)}`;
     else {
       const sec = [
         ["strict-transport-security", "HSTS — forces HTTPS"],
@@ -1349,14 +1342,14 @@ async function toolHeaders(domain) {
         ["referrer-policy", "referrer privacy"],
         ["permissions-policy", "browser-feature control"],
       ];
-      const n = sec.filter(([h]) => headers.get(h)).length;
+      const n = sec.filter(([h]) => doc.hdr[h]).length;
       const grade = n >= 5 ? "A" : n === 4 ? "B" : n === 3 ? "C" : n === 2 ? "D" : "F";
       const gcls = n >= 4 ? "ok" : n >= 2 ? "warn" : "down";
       const secRows = sec.map(([h, d]) => {
-        const v = headers.get(h);
+        const v = doc.hdr[h];
         return `<div class="row"><span>${h}<br><span class="muted small">${d}</span></span><b>${v ? '<span class="up">✓ present</span>' : '<span class="down">✗ missing</span>'}</b></div>`;
       }).join("");
-      const allRows = [...headers].map(([k, v]) =>
+      const allRows = Object.entries(doc.hdr).map(([k, v]) =>
         `<div class="row"><span>${esc(k)}</span><b class="mono" style="word-break:break-all;font-weight:500">${esc(v.length > 160 ? v.slice(0, 160) + "…" : v)}</b></div>`).join("");
       result = `<div class="verdict ${gcls}"><b>${esc(domain)}</b> — security-headers grade <b>${grade}</b> (${n}/6 present). ${gcls === "ok" ? "✅" : gcls === "warn" ? "⚠️" : "🔴"}</div>
         <div class="kicker" style="margin-top:18px">Security headers</div>
@@ -1454,14 +1447,9 @@ async function toolWhois(domain) {
 async function toolTech(domain) {
   let result = "";
   if (domain) {
-    let H = "", hdr = {}, ok = false;
-    try {
-      const r = await fetch(`https://${domain}/`, { redirect: "follow", signal: AbortSignal.timeout(8000), headers: { "user-agent": BROWSER_UA } });
-      for (const [k, v] of r.headers) hdr[k.toLowerCase()] = v;
-      H = (await r.text()).slice(0, 250000);
-      ok = true;
-    } catch { }
-    if (!ok) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond — nothing to fingerprint. 🔴</div>${crossLink(domain)}`;
+    const doc = await fetchDoc(`https://${domain}/`, 200000);
+    const H = doc.html, hdr = doc.hdr;
+    if (!doc.ok) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond — nothing to fingerprint. 🔴</div>${crossLink(domain)}`;
     else {
       const gen = (H.match(/<meta[^>]+name=["']generator["'][^>]+content=["']([^"']+)/i) || [])[1] || "";
       const powered = hdr["x-powered-by"] || "", server = hdr["server"] || "", cookie = hdr["set-cookie"] || "";
@@ -1526,6 +1514,37 @@ async function ttfb(url) {
     await fetch(url, { redirect: "manual", cf: { cacheTtl: 0 }, signal: AbortSignal.timeout(8000), headers: { "user-agent": BROWSER_UA } });
     return Date.now() - t0;
   } catch { return null; }
+}
+
+// Robust page fetch for /headers and /tech: follows redirects, reads at most
+// maxBytes of the body (so a huge/slow page can't time us out), retries once.
+async function fetchDoc(url, maxBytes) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch(url, {
+        redirect: "follow",
+        signal: AbortSignal.timeout(9000),
+        headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,*/*;q=0.8" },
+      });
+      const hdr = {};
+      for (const [k, v] of r.headers) hdr[k.toLowerCase()] = v;
+      let html = "";
+      if (maxBytes > 0 && r.body) {
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let total = 0;
+        while (total < maxBytes) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.length;
+          html += dec.decode(value, { stream: true });
+        }
+        try { await reader.cancel(); } catch { }
+      } else if (r.body) { try { await r.body.cancel(); } catch { } }
+      return { ok: true, status: r.status, hdr, html };
+    } catch { /* retry once */ }
+  }
+  return { ok: false, hdr: {}, html: "" };
 }
 
 async function toolSpeed(domain, request, env) {
