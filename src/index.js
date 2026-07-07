@@ -2067,6 +2067,136 @@ const GUIDES = {
       <h2>See it yourself</h2>
       <p><a href="/">Check any domain</a> and HostCop shows the IP, its ASN, and the organisation behind it — the real answer to "who hosts this?".</p>`,
   },
+  "how-to-choose-a-web-host": {
+    title: "How to choose a web host (without falling for fake reviews)",
+    desc: "A practical checklist for picking a web host based on measured performance, not affiliate-paid reviews.",
+    date: "2026-07-06",
+    body: `<p>Almost every "best web hosting 2026" list is an affiliate page — the hosts at the top are the ones paying the biggest commission, not the fastest or most reliable. Here's how to choose based on facts instead.</p>
+      <h2>1. Ignore the review sites</h2>
+      <p>If a page ranks hosts and links to them with tracking codes, assume the order is paid for. Real quality is measurable, so measure it. HostCop's <a href="/hosts">rankings</a> are built purely from live checks — uptime and response time — with no affiliate money involved.</p>
+      <h2>2. What actually matters</h2>
+      <p><b>Uptime</b> (does it stay online), <b>response time / TTFB</b> (how fast the server answers), <b>real support</b> (can they fix server issues, not just read a script), and <b>honest infrastructure</b> (are they a real host or reselling someone else's servers at a markup?). Price matters too, but cheap-and-slow is the most expensive option once you lose visitors.</p>
+      <h2>3. Verify with data before you buy</h2>
+      <p>Pick two or three candidates and check sites already hosted on them. <a href="/speed">Test their speed</a>, look at their <a href="/hosts">measured uptime</a>, and <a href="/compare">compare them head to head</a>. If a "host" turns out to run on Amazon or Hetzner, you may be paying a reseller markup — <a href="/">a full report</a> reveals that.</p>
+      <h2>4. Red flags</h2>
+      <p>"Unlimited everything" for a couple of dollars (oversold shared servers), support that always escalates "to the datacenter" (reseller), and no clear answer about where your site physically runs. When in doubt, favour a host that owns its infrastructure.</p>
+      <h2>The shortcut</h2>
+      <p>Start at the <a href="/hosts">HostCop rankings</a>, shortlist by measured uptime and speed, then <a href="/">check a few real sites</a> on each. Data beats reviews every time.</p>`,
+  },
+  "shared-vs-vps-vs-cloud-hosting": {
+    title: "Shared vs VPS vs cloud hosting: which do you need?",
+    desc: "Plain-English comparison of shared, VPS and cloud hosting — what each means, what it costs, and who it's for.",
+    date: "2026-07-06",
+    body: `<p>The three words you'll see everywhere when buying hosting — shared, VPS, cloud — describe how your website shares a physical server with others. Here's the difference in plain terms.</p>
+      <h2>Shared hosting</h2>
+      <p>Your site sits on one server alongside hundreds of others, all sharing the same CPU and memory. It's the cheapest option (a few dollars a month) and fine for small sites, blogs and brochure pages. The downside: a busy neighbour can slow you down, and it's often oversold. Most cheap "unlimited" plans are shared hosting.</p>
+      <h2>VPS (Virtual Private Server)</h2>
+      <p>The server is split into isolated virtual machines, and you get a guaranteed slice of CPU and RAM that others can't steal. More money (roughly $5–40/mo), more control, and far more consistent performance. Good once a site outgrows shared hosting or needs custom software.</p>
+      <h2>Cloud hosting</h2>
+      <p>Your site runs across a pool of servers instead of one machine, so it can scale up under traffic spikes and survive a single server failing. Providers like AWS, Google Cloud and DigitalOcean sell this. Pricing is usually usage-based. Best for apps that must stay up and handle variable load.</p>
+      <h2>How to tell what a site uses</h2>
+      <p>You often can't tell shared from VPS from the outside, but you <i>can</i> see the real infrastructure. <a href="/">Check a domain on HostCop</a> and it names the network behind it — if a small "host" actually runs on Amazon or Hetzner, that's resold cloud infrastructure. Lots of unrelated sites on <a href="/reverse-ip">the same IP</a> usually means shared hosting.</p>
+      <h2>Which should you pick?</h2>
+      <p>Small site on a budget: shared. Growing site that needs reliable speed: VPS. App that must scale and stay up: cloud. And whatever you choose, <a href="/monitor">monitor it</a> so you know the moment it goes down.</p>`,
+  },
+  "why-emails-go-to-spam": {
+    title: "Why your emails go to spam (and how to fix it)",
+    desc: "The real reasons business email lands in spam — SPF, DKIM and DMARC — and how to check and fix yours.",
+    date: "2026-07-06",
+    body: `<p>If your emails keep landing in spam, the cause is usually not your words — it's that receivers can't verify your mail is really from you. Three DNS records fix that.</p>
+      <h2>SPF — who's allowed to send</h2>
+      <p>SPF is a DNS record listing which servers may send email as your domain. Without it, anyone can forge your address, so receivers distrust everything. With a strict SPF record, they can reject fakes.</p>
+      <h2>DKIM — a tamper-proof signature</h2>
+      <p>DKIM cryptographically signs each message. The receiver checks the signature against a public key in your DNS. If it matches, the mail genuinely came from you and wasn't altered in transit.</p>
+      <h2>DMARC — the policy that ties it together</h2>
+      <p>DMARC tells receivers what to do with mail that fails SPF or DKIM: monitor it (p=none), send it to spam (p=quarantine), or reject it outright (p=reject). Crucially, <b>p=none does nothing</b> to stop spoofing — it only reports. Move to quarantine or reject once you're confident.</p>
+      <h2>Other common causes</h2>
+      <p>A brand-new sending domain with no reputation, links to a mismatched domain, spammy words, or sending from a shared IP with a bad history. But missing SPF/DKIM/DMARC is the number-one fixable cause.</p>
+      <h2>Check yours in seconds</h2>
+      <p>Run your domain through HostCop's <a href="/email">email deliverability checker</a>. It reads your SPF, DKIM and DMARC records, grades them, and tells you exactly what's missing — so you can hand the fix to your email provider or DNS host.</p>`,
+  },
+  "what-is-a-cdn": {
+    title: "What is a CDN, and do you need one?",
+    desc: "What a content delivery network does, when it helps, and how to tell if a site is already using one.",
+    date: "2026-07-06",
+    body: `<p>A CDN — content delivery network — is a layer of servers spread around the world that sits in front of your website and serves copies of it from wherever your visitor is. Here's what that actually buys you.</p>
+      <h2>What a CDN does</h2>
+      <p>Instead of every visitor reaching your one origin server (which might be on another continent), they hit the nearest CDN "edge" server, which serves cached content instantly. Cloudflare, Akamai and Fastly are the big names.</p>
+      <h2>Why people use one</h2>
+      <p><b>Speed</b> — content is closer to visitors, so pages load faster globally. <b>Protection</b> — CDNs absorb traffic spikes and block DDoS attacks. <b>Free SSL</b> — most include HTTPS. <b>Less load</b> — your origin server does less work.</p>
+      <h2>The catch</h2>
+      <p>A CDN <i>hides</i> your real host. Anyone looking up your site sees the CDN, not the origin — which is great for security but means the CDN's speed masks how good (or bad) your actual host is. Your real host still determines performance for anything the CDN can't cache.</p>
+      <h2>Do you need one?</h2>
+      <p>If you have visitors in more than one region, or you want DDoS protection and free SSL, a CDN is almost always worth it — and Cloudflare's free tier costs nothing. A small, single-region site may not need one.</p>
+      <h2>Is a site already using a CDN?</h2>
+      <p><a href="/">Check it on HostCop</a> — we flag CDNs explicitly and even try to reveal the <b>real origin host hidden behind them</b>. The <a href="/tech">tech-stack tool</a> also detects the CDN in use.</p>`,
+  },
+  "how-to-check-if-a-website-is-down": {
+    title: "Is it down, or is it just you? How to check",
+    desc: "How to tell whether a website is really down for everyone or just unreachable from your network.",
+    date: "2026-07-06",
+    body: `<p>A site won't load. Before you panic (or blame the host), find out whether it's actually down for everyone — or just unreachable from where you are.</p>
+      <h2>Down for everyone vs just you</h2>
+      <p>If a site is genuinely down, it fails from everywhere. If it works from other networks but not yours, the problem is local: your ISP, a stale DNS cache, a VPN, or a firewall. The two need completely different fixes.</p>
+      <h2>Check from multiple locations</h2>
+      <p>The reliable test is to reach the site from several places at once. HostCop's <a href="/down">is-it-down checker</a> pings the site from <b>five regions</b> (North America, Europe, Asia, South America, Oceania) and tells you how many can reach it — so you instantly know if it's a global outage or a local issue.</p>
+      <h2>If it's just you</h2>
+      <p>Flush your DNS cache, try a different network (e.g. mobile data), disable your VPN, or switch DNS to 1.1.1.1 or 8.8.8.8. The site is fine; your path to it isn't.</p>
+      <h2>If it's really down</h2>
+      <p>Check whether it's the whole server or one thing: is it a <a href="/ssl">certificate problem</a>, a <a href="/redirect">redirect loop</a>, or a 5xx server error? A <a href="/">full report</a> shows the status code and who to contact (the host).</p>
+      <h2>Never be the last to know</h2>
+      <p>If it's your own site, set up <a href="/monitor">free monitoring</a> — HostCop emails you the moment it goes down, so you hear it from us, not from an angry customer.</p>`,
+  },
+  "ssl-certificate-expired": {
+    title: "SSL certificate expired? What it means and how to fix it",
+    desc: "What happens when an SSL certificate expires, why it breaks your site, and how to renew and never get caught again.",
+    date: "2026-07-06",
+    body: `<p>An expired SSL certificate is one of the most avoidable ways to break a website — and one of the most common. Here's what it means and how to fix it fast.</p>
+      <h2>What actually happens</h2>
+      <p>An SSL/TLS certificate proves your site is really yours and encrypts traffic. It has an expiry date. The moment it lapses, every browser shows a full-page red <b>"Your connection is not private"</b> warning, and most visitors leave immediately. The site itself is fine — but nobody can get past the warning.</p>
+      <h2>How to fix it now</h2>
+      <p>Renew or reissue the certificate through whoever provides it — your host, Cloudflare, or a service like Let's Encrypt. If you use Cloudflare or a modern host, SSL usually auto-renews; a lapse often means auto-renewal broke and needs re-enabling.</p>
+      <h2>Why it lapsed</h2>
+      <p>Common causes: a manual certificate nobody remembered to renew, a domain that changed hosts, DNS validation that stopped working, or auto-renewal silently failing. Free Let's Encrypt certs last 90 days, so they must renew automatically.</p>
+      <h2>Check any certificate's expiry</h2>
+      <p>Run your domain through HostCop's <a href="/ssl">SSL checker</a> — it reads the certificate straight from the server and tells you the exact expiry date, days remaining, and the issuer.</p>
+      <h2>Never get caught again</h2>
+      <p>Set up <a href="/monitor">free monitoring</a>. HostCop emails you when your certificate is within <b>14 days</b> of expiring, so you always have time to renew before visitors ever see a warning.</p>`,
+  },
+  "dns-records-explained": {
+    title: "DNS records explained: A, AAAA, MX, TXT, NS, CNAME",
+    desc: "A beginner-friendly guide to the DNS records that make your website and email work.",
+    date: "2026-07-06",
+    body: `<p>DNS is the internet's address book: it turns a domain name into the information browsers and mail servers need. Here are the records you'll actually deal with.</p>
+      <h2>A and AAAA — where the website lives</h2>
+      <p>An <b>A record</b> points your domain to an IPv4 address (like 192.0.2.1); an <b>AAAA record</b> does the same for IPv6. This is what sends visitors to your web server. Change it and you move your site to a new host.</p>
+      <h2>CNAME — an alias</h2>
+      <p>A <b>CNAME</b> points one name at another name instead of an IP — e.g. <code>www</code> pointing to your root domain, or a subdomain pointing to a service like a CDN or site builder.</p>
+      <h2>MX — where email goes</h2>
+      <p><b>MX records</b> tell the world which mail servers handle email for your domain. If your email runs on Google Workspace or Microsoft 365, your MX records point there. No MX records means no incoming mail.</p>
+      <h2>TXT — notes and verification</h2>
+      <p><b>TXT records</b> hold plain text used for verification and email security — your <b>SPF</b> and <b>DMARC</b> records live here, as do domain-ownership checks for various services.</p>
+      <h2>NS — who runs your DNS</h2>
+      <p><b>NS records</b> name the authoritative nameservers for your domain — the DNS provider (your registrar, Cloudflare, etc.) that answers all these lookups.</p>
+      <h2>See all of them for any domain</h2>
+      <p>HostCop's <a href="/dns">DNS lookup tool</a> shows every record — A, AAAA, MX, TXT, NS and CNAME — in one place, and the <a href="/dns-propagation">propagation checker</a> tells you if a change has spread yet.</p>`,
+  },
+  "why-is-my-website-slow": {
+    title: "Why is my website slow? Start with TTFB",
+    desc: "How to diagnose a slow website, starting with time to first byte — the truest measure of hosting speed.",
+    date: "2026-07-06",
+    body: `<p>"My site is slow" has many causes, but there's one number that tells you whether the problem is your <i>host</i> or your <i>page</i>: time to first byte.</p>
+      <h2>What TTFB is</h2>
+      <p>Time to first byte (TTFB) is how long the server takes to <i>start</i> responding — before any images, fonts or scripts load. It measures the backend and the host, not the page weight. Under 200 ms is excellent; over a second points to a slow server or a heavy backend.</p>
+      <h2>If TTFB is high, blame the backend</h2>
+      <p>A slow TTFB usually means an overloaded shared host, a slow database, no caching, or a server far from your visitors. Fixes: better hosting, a caching layer, or a CDN to serve content closer to users. Compare your host's real speed in the <a href="/hosts">rankings</a>.</p>
+      <h2>If TTFB is low but the page still feels slow</h2>
+      <p>Then it's the front end: huge images, too many scripts, render-blocking resources. That's a page-optimisation problem, not a hosting one — compress images, defer scripts, and lazy-load.</p>
+      <h2>Measure it properly</h2>
+      <p>HostCop's <a href="/speed">speed test</a> measures TTFB from <b>five regions</b> and grades it, and tells you how you compare to every site we've checked. Testing from multiple regions matters — a site can be fast near its server and slow on the other side of the world.</p>
+      <h2>Still slow after all that?</h2>
+      <p>If your host's measured speed is poor across the board, the fix may simply be a better host. <a href="/compare">Compare two hosts</a> on real data before you switch.</p>`,
+  },
 };
 
 function pageGuidesIndex() {
