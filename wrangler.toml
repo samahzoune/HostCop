@@ -16,3 +16,13 @@ crons = ["*/30 * * * *"]
 binding = "DB"
 database_name = "hostcop"
 database_id = "6f75f0f9-91c3-42bd-b047-2425efdb3e49"
+
+# Regional probers — one Durable Object per region, placed via locationHint,
+# so /speed, /down and monitoring can measure from multiple locations.
+[[durable_objects.bindings]]
+name = "PROBER"
+class_name = "Prober"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Prober"]

@@ -81,6 +81,55 @@ export default {
 };
 
 // ========================================================================
+// MULTI-REGION: a Durable Object placed in each region measures from there
+// ========================================================================
+
+// Cloudflare location hints → friendly labels. Each becomes one prober DO.
+const REGIONS = [
+  ["enam", "N. America"],
+  ["weur", "Europe"],
+  ["apac", "Asia"],
+  ["sam", "S. America"],
+  ["oc", "Oceania"],
+];
+
+// The prober runs inside a region and times a single request to the target.
+export class Prober {
+  constructor(state, env) { this.state = state; this.env = env; }
+  async fetch(request) {
+    const target = new URL(request.url).searchParams.get("url");
+    if (!target) return Response.json({ error: "no url" }, { status: 400 });
+    const t0 = Date.now();
+    let status = 0, up = false;
+    try {
+      const r = await fetch(target, {
+        redirect: "manual", cf: { cacheTtl: 0 }, signal: AbortSignal.timeout(8000),
+        headers: { "user-agent": BROWSER_UA, accept: "text/html,application/xhtml+xml,*/*;q=0.8" },
+      });
+      status = r.status; up = true;
+      try { await r.body?.cancel(); } catch { }
+    } catch { }
+    return Response.json({ ms: Date.now() - t0, status, up });
+  }
+}
+
+// Fan out to every regional prober in parallel. Returns per-region results,
+// or null if Durable Objects aren't available (falls back to single region).
+async function probeRegions(url, env) {
+  if (!env.PROBER) return null;
+  return Promise.all(REGIONS.map(async ([hint, label]) => {
+    try {
+      const stub = env.PROBER.get(env.PROBER.idFromName(hint), { locationHint: hint });
+      const d = await Promise.race([
+        stub.fetch(`https://prober/?url=${encodeURIComponent(url)}`).then(r => r.json()),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 12000)),
+      ]);
+      return { hint, label, ms: d.ms ?? null, status: d.status ?? 0, up: !!d.up };
+    } catch { return { hint, label, ms: null, status: 0, up: false }; }
+  }));
+}
+
+// ========================================================================
 // CORE: detect + measure + store
 // ========================================================================
 
@@ -368,7 +417,10 @@ function buildClientHello(host) {
   const points = ext(0x000b, Uint8Array.of(1, 0x00));
   const sigs = [0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0601, 0x0201];
   const sigExt = ext(0x000d, concatBytes(u16(sigs.length * 2), ...sigs.map(u16)));
-  const extensions = concatBytes(sni, groups, points, sigExt);
+  // Empty renegotiation_info (RFC 5746). Strict CDNs like Cloudflare abort the
+  // handshake without it, which made the cert unreadable on TLS-1.3-default hosts.
+  const reneg = ext(0xff01, Uint8Array.of(0x00));
+  const extensions = concatBytes(sni, groups, points, sigExt, reneg);
 
   const ciphers = [0xc02f, 0xc030, 0xc02b, 0xc02c, 0x009c, 0x009d, 0x002f, 0x0035];
   const random = new Uint8Array(32);
@@ -1071,9 +1123,10 @@ async function runMonitors(env) {
     let res = await runCheck(domain, "monitor", env);
     if (!res) continue;
     let isUp = res.noDns ? false : !!res.up;
-    if (!isUp) {                                   // confirm down with a 2nd check (single-region safety)
-      const res2 = await runCheck(domain, "monitor", env);
-      if (res2) { res = res2; isUp = !res2.noDns && !!res2.up; }
+    if (!isUp && !res.noDns) {                      // confirm down from multiple regions before alerting
+      const regions = await probeRegions(`https://${domain}/`, env);
+      if (regions) isUp = regions.some(r => r.up);   // reachable from ANY region → not a real outage
+      else { const res2 = await runCheck(domain, "monitor", env); if (res2) { res = res2; isUp = !res2.noDns && !!res2.up; } }
     }
     const cur = isUp ? "up" : "down";
     const { results: subs } = await env.DB.prepare(
@@ -1165,22 +1218,40 @@ async function toolDown(domain, env) {
     const res = await runCheck(domain, "tool", env);
     if (!res) result = `<p class="note">Couldn't check that domain — please try again.</p>`;
     else if (res.noDns) result = `<div class="verdict down"><b>${esc(domain)}</b> doesn't resolve — no DNS records found. 🔴</div>${crossLink(domain)}`;
-    else if (res.up) result = `<div class="verdict ok"><b>${esc(domain)}</b> is UP — it responded in ${res.ms} ms (HTTP ${res.finalStatus}). ✅</div>
-      <p class="note">It's up from HostCop's network. If <b>you</b> can't reach it, the problem is most likely on your side — ISP, DNS cache, VPN or firewall. Try another network or flush your DNS.</p>
-      <div class="card"><div class="row"><span>Status</span><b><span class="up">UP</span> · HTTP ${res.finalStatus} · ${esc(statusText(res.finalStatus))}</b></div>
-        <div class="row"><span>Response time</span><b>${res.ms} ms</b></div>
-        <div class="row"><span>Hosted by</span><b>${esc(res.brand)}</b></div>
-        <div class="row"><span>IP</span><b>${esc(res.ip || "—")}</b></div></div>${crossLink(domain)}`;
-    else result = `<div class="verdict down"><b>${esc(domain)}</b> appears to be DOWN — no response. 🔴</div>
-      <p class="note">HostCop couldn't reach it. We check from a single network, so if it's an intermittent blip, retry in a minute.</p>${crossLink(domain)}`;
+    else {
+      const regions = await probeRegions(`https://${res.domain}/`, env);
+      const hostCard = `<div class="card"><div class="row"><span>Hosted by</span><b>${esc(res.brand)}</b></div>
+        <div class="row"><span>IP</span><b>${esc(res.ip || "—")}</b></div></div>`;
+      if (!regions) {
+        // Fallback: single region
+        result = res.up
+          ? `<div class="verdict ok"><b>${esc(domain)}</b> is UP — it responded in ${res.ms} ms (HTTP ${res.finalStatus}). ✅</div>
+             <p class="note">If <b>you</b> can't reach it, the problem is most likely local — ISP, DNS cache, VPN or firewall.</p>${hostCard}${crossLink(domain)}`
+          : `<div class="verdict down"><b>${esc(domain)}</b> appears to be DOWN — no response. 🔴</div>${crossLink(domain)}`;
+      } else {
+        const upCount = regions.filter(r => r.up).length, total = regions.length;
+        const rows = regions.map(r => `<div class="row"><span>${esc(r.label)}</span><b>${r.up ? `<span class="up">UP</span> · ${r.ms} ms` : '<span class="down">DOWN</span>'}</b></div>`).join("");
+        const allUp = upCount === total && res.up;
+        const allDown = upCount === 0 && !res.up;      // primary check agrees it's down
+        let verdict, cls;
+        if (allUp) { cls = "ok"; verdict = `<b>${esc(domain)}</b> is UP from all ${total} locations. ✅`; }
+        else if (allDown) { cls = "down"; verdict = `<b>${esc(domain)}</b> is DOWN from every location — it's not just you. 🔴`; }
+        else { cls = "warn"; verdict = `<b>${esc(domain)}</b> is reachable from ${upCount}/${total} regions — likely a regional or network issue, not a full outage. 🟡`; }
+        result = `<div class="verdict ${cls}">${verdict}</div>
+          <div class="kicker" style="margin-top:16px">By region</div>
+          <div class="card">${rows}</div>
+          <p class="muted small">Checked live from ${total} Cloudflare regions. If it's up here but down for you, the problem is local (ISP / DNS / VPN).</p>
+          ${hostCard}${crossLink(domain)}`;
+      }
+    }
   }
   return toolShell({
     title: domain ? `Is ${domain} down right now? · HostCop` : "Is it down? Website down checker · HostCop",
     desc: domain ? `Is ${domain} down or is it just you? Live status, response time and who hosts it.` : "Check if any website is down for everyone or just you — live status from HostCop.",
     path: domain ? "/down/" + domain : "/down", base: "/down", domain, result,
     h1: domain ? `Is ${esc(domain)} down?` : "Is a website down?",
-    intro: "Enter a domain to see if it's down for everyone — or just you. We check it live and tell you what's actually happening.",
-    faq: `<h2>Down for everyone, or just me?</h2><p>If HostCop shows the site is <b>up</b> but you can't reach it, the outage is almost certainly local: your ISP, a stale DNS cache, a VPN, or a firewall. If HostCop also can't reach it, the site itself is likely having problems.</p>` });
+    intro: "Enter a domain to see if it's down for everyone — or just you. We check it live from several regions and tell you what's actually happening.",
+    faq: `<h2>Down for everyone, or just me?</h2><p>HostCop checks from multiple Cloudflare regions. If it's <b>up</b> from our locations but you can't reach it, the outage is almost certainly local: your ISP, a stale DNS cache, a VPN, or a firewall. If it's down from all regions, the site itself is having problems.</p>` });
 }
 
 async function toolSsl(domain) {
@@ -1563,31 +1634,42 @@ async function toolSpeed(domain, request, env) {
     else if (!res.up) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond, so there's no speed to measure. 🔴</div>${crossLink(domain)}`;
     else {
       const url = res.finalUrl;
-      const samples = [res.ms, await ttfb(url), await ttfb(url)].filter(x => x != null).sort((a, b) => a - b);
-      const median = samples[Math.floor(samples.length / 2)];
-      const best = samples[0];
-      const [grade, label, cls] = median < 200 ? ["A", "fast", "ok"] : median < 500 ? ["B", "good", "ok"]
-        : median < 1000 ? ["C", "average", "warn"] : median < 2000 ? ["D", "slow", "warn"] : ["F", "very slow", "down"];
-      const emoji = cls === "ok" ? "✅" : cls === "warn" ? "⚠️" : "🔴";
-      const pctRow = await env.DB.prepare(
-        "SELECT ROUND(100.0*AVG(CASE WHEN response_ms > ? THEN 1 ELSE 0 END)) p FROM checks WHERE up=1").bind(median).first();
-      const pct = pctRow?.p;
-      const region = res.finalUrl ? (request.cf?.colo || "edge") : "edge";
-      result = `<div class="verdict ${cls}"><b>${esc(domain)}</b> responded in <b>${median} ms</b> — ${label} (grade ${grade}).${pct != null && pct >= 40 ? ` Faster than ${pct}% of sites we've checked.` : ""} ${emoji}</div>
-        <div class="stats">
-          <div><b>${grade}</b><span>grade</span></div>
-          <div><b>${median} ms</b><span>median TTFB</span></div>
-          <div><b>${best} ms</b><span>fastest</span></div>
-          <div><b>${samples.length}</b><span>samples</span></div>
-        </div>
-        <div class="card">
-          <div class="row"><span>Samples</span><b>${samples.join(" · ")} ms</b></div>
-          <div class="row"><span>Tested from</span><b>${esc(region)} · Cloudflare edge</b></div>
-          <div class="row"><span>Hosted by</span><b><a href="/host/${encodeURIComponent(res.brand)}">${esc(res.brand)}</a></b></div>
-          <div class="row"><span>Final URL</span><b>${esc(shortUrl(url))}</b></div>
-        </div>
-        <p class="muted small">Time to first byte, measured from a single Cloudflare edge location closest to the check. Multi-region timing is on the roadmap.</p>
-        ${crossLink(domain)}`;
+      const regions = await probeRegions(url, env);
+      let samples, perRegionRows = "", sourceNote;
+      if (regions) {
+        const up = regions.filter(r => r.up && r.ms != null);
+        samples = up.map(r => r.ms).sort((a, b) => a - b);
+        perRegionRows = regions.map(r => `<div class="row"><span>${esc(r.label)}</span><b>${r.up && r.ms != null ? `${r.ms} ms` : '<span class="down">no response</span>'}</b></div>`).join("");
+        sourceNote = `Time to first byte, measured live from ${regions.length} Cloudflare regions.`;
+      } else {
+        samples = [res.ms, await ttfb(url), await ttfb(url)].filter(x => x != null).sort((a, b) => a - b);
+        sourceNote = "Time to first byte from a single Cloudflare edge (multi-region temporarily unavailable).";
+      }
+      if (!samples.length) result = `<div class="verdict down"><b>${esc(domain)}</b> didn't respond, so there's no speed to measure. 🔴</div>${crossLink(domain)}`;
+      else {
+        const median = samples[Math.floor(samples.length / 2)];
+        const best = samples[0];
+        const [grade, label, cls] = median < 200 ? ["A", "fast", "ok"] : median < 500 ? ["B", "good", "ok"]
+          : median < 1000 ? ["C", "average", "warn"] : median < 2000 ? ["D", "slow", "warn"] : ["F", "very slow", "down"];
+        const emoji = cls === "ok" ? "✅" : cls === "warn" ? "⚠️" : "🔴";
+        const pctRow = await env.DB.prepare(
+          "SELECT ROUND(100.0*AVG(CASE WHEN response_ms > ? THEN 1 ELSE 0 END)) p FROM checks WHERE up=1").bind(median).first();
+        const pct = pctRow?.p;
+        result = `<div class="verdict ${cls}"><b>${esc(domain)}</b> — median <b>${median} ms</b>${regions ? ` across ${samples.length} region${samples.length === 1 ? "" : "s"}` : ""}, ${label} (grade ${grade}).${pct != null && pct >= 40 ? ` Faster than ${pct}% of sites we've checked.` : ""} ${emoji}</div>
+          <div class="stats">
+            <div><b>${grade}</b><span>grade</span></div>
+            <div><b>${median} ms</b><span>median TTFB</span></div>
+            <div><b>${best} ms</b><span>fastest</span></div>
+            <div><b>${samples.length}</b><span>${regions ? "regions" : "samples"}</span></div>
+          </div>
+          ${perRegionRows ? `<div class="kicker" style="margin-top:16px">By region</div><div class="card">${perRegionRows}</div>` : ""}
+          <div class="card">
+            <div class="row"><span>Hosted by</span><b><a href="/host/${encodeURIComponent(res.brand)}">${esc(res.brand)}</a></b></div>
+            <div class="row"><span>Final URL</span><b>${esc(shortUrl(url))}</b></div>
+          </div>
+          <p class="muted small">${sourceNote}</p>
+          ${crossLink(domain)}`;
+      }
     }
   }
   return toolShell({
@@ -1738,7 +1820,7 @@ function pageMethodology() {
      <h2>How rankings are built</h2>
      <p>A host must have at least <b>3 checks</b> to appear in the rankings. We then order hosts by measured uptime, then by average response time. You can re-sort by fastest or most-tested. There is no manual curation and no sponsored placement — the ranking <i>is</i> the data.</p>
      <h2>Honest limits</h2>
-     <p>Response time today is measured from one region, so it reflects performance to a well-connected network rather than every corner of the world (multi-region measurement is on the roadmap). ASN location is the network's registered country, which is an approximation of physical server location. And behind a CDN, we measure the CDN edge — not the hidden origin. We'd rather tell you these limits than pretend the data is perfect.</p>`);
+     <p>The speed test and the "is it down" tool measure from <b>five Cloudflare regions</b> (North America, Europe, Asia, South America, Oceania) via edge-placed probes, so you see real per-region timing and we only call a site "down" when every region fails to reach it. Region placement is best-effort, so a probe sits <i>near</i> its region, not at a fixed city. ASN location is the network's registered country, an approximation of physical server location. And behind a CDN, we measure the CDN edge — not the hidden origin. We'd rather tell you these limits than pretend the data is perfect.</p>`);
 }
 
 function pageAbout() {
