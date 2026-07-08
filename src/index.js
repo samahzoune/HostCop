@@ -1279,6 +1279,16 @@ function pagePricing(url, env) {
     title: "Pricing — free tools, Pro monitoring · HostCop",
     desc: "HostCop's tools are free forever. Pro adds monitoring for up to 50 sites checked every 5 minutes. No affiliate links, ever.",
     path: "/pricing",
+    jsonld: [{
+      "@context": "https://schema.org", "@type": "Product",
+      name: "HostCop", description: "Neutral hosting watchdog with free website tools and optional Pro uptime + SSL monitoring.",
+      brand: { "@type": "Brand", name: "HostCop" }, url: `${BASE}/pricing`,
+      offers: [
+        { "@type": "Offer", name: "Free", price: "0", priceCurrency: "USD", availability: "https://schema.org/InStock", url: `${BASE}/pricing` },
+        { "@type": "Offer", name: "Pro", price: "7.00", priceCurrency: "USD", availability: "https://schema.org/InStock", url: `${BASE}/pricing`,
+          priceSpecification: { "@type": "UnitPriceSpecification", price: "7.00", priceCurrency: "USD", referenceQuantity: { "@type": "QuantitativeValue", value: "1", unitCode: "MON" } } },
+      ],
+    }],
     body: `<h1>Pricing</h1>
       <div class="trustbadge">🛡 All tools free forever · No affiliate links, ever</div>
       ${notice}
