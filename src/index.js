@@ -2207,6 +2207,122 @@ const GUIDES = {
       <h2>Still slow after all that?</h2>
       <p>If your host's measured speed is poor across the board, the fix may simply be a better host. <a href="/compare">Compare two hosts</a> on real data before you switch.</p>`,
   },
+  "how-long-does-dns-propagation-take": {
+    title: "How long does DNS propagation take?",
+    desc: "Why DNS changes aren't instant, how long propagation really takes, and how to check if yours is done.",
+    date: "2026-07-06",
+    body: `<p>You changed a DNS record — pointed your domain at a new host, or updated your nameservers — and now you're staring at your site wondering why nothing's happened. That wait is called DNS propagation.</p>
+      <h2>Why it isn't instant</h2>
+      <p>DNS answers are cached all over the internet — by your ISP, public resolvers, and your own device — so a change doesn't reach everyone at once. Each cache holds the old answer until its <b>TTL</b> (time to live) runs out, then fetches the new one.</p>
+      <h2>How long it really takes</h2>
+      <p>Usually minutes to a couple of hours. It can take up to <b>48 hours</b> in the worst case, mostly determined by the record's TTL. A record with a 300-second TTL updates fast; one set to 86400 (a day) can lag a long time. Lowering the TTL <i>before</i> a planned change makes future switches quicker.</p>
+      <h2>What happens during propagation</h2>
+      <p>While it's spreading, some visitors reach the new server and some still hit the old one. That's why a freshly migrated site can look "up for me, down for them" for a while.</p>
+      <h2>How to check if it's done</h2>
+      <p>Compare what different DNS resolvers return. HostCop's <a href="/dns-propagation">DNS propagation checker</a> queries several major public resolvers at once and tells you whether they all agree yet — and it's smart enough to distinguish a real propagation delay from a site that simply uses load-balancing.</p>
+      <h2>Speed it up</h2>
+      <p>You can't force other people's caches to expire, but you can flush your own (restart your router, or clear your OS DNS cache) and lower TTLs ahead of time. Otherwise, patience — and the <a href="/dns">DNS lookup tool</a> to confirm the record itself is correct.</p>`,
+  },
+  "website-security-headers-explained": {
+    title: "Website security headers explained (HSTS, CSP and more)",
+    desc: "What HTTP security headers do, which ones matter, and how to check your site's grade in seconds.",
+    date: "2026-07-06",
+    body: `<p>Security headers are small instructions your server sends with every page that tell the browser how to protect your visitors. They're free to add and one of the clearest signs of a well-run site — yet most sites are missing several.</p>
+      <h2>HSTS (Strict-Transport-Security)</h2>
+      <p>Forces browsers to always use HTTPS for your site, even if someone types <code>http://</code>. It blocks downgrade attacks where an attacker tries to strip your encryption.</p>
+      <h2>CSP (Content-Security-Policy)</h2>
+      <p>The most powerful header: it controls which scripts, styles and resources are allowed to load. A good CSP shuts down most cross-site scripting (XSS) attacks — the most common way sites get hijacked.</p>
+      <h2>X-Frame-Options</h2>
+      <p>Stops other sites from embedding yours in an invisible frame to trick users into clicking things — an attack called clickjacking.</p>
+      <h2>X-Content-Type-Options</h2>
+      <p>Set to <code>nosniff</code>, it stops browsers from guessing file types, which can otherwise be abused to run malicious content.</p>
+      <h2>Referrer-Policy &amp; Permissions-Policy</h2>
+      <p>Referrer-Policy controls how much address information leaks when visitors click away; Permissions-Policy limits which browser features (camera, microphone, geolocation) your pages can use.</p>
+      <h2>Check your grade</h2>
+      <p>HostCop's <a href="/headers">HTTP headers tool</a> shows every response header and grades your six key security headers, so you can see exactly which ones to add. Most are one line in your server or CDN config.</p>`,
+  },
+  "how-to-find-a-websites-ip-address": {
+    title: "How to find a website's IP address",
+    desc: "Several ways to find the IP behind any domain — and why the answer might be a CDN, not the real server.",
+    date: "2026-07-06",
+    body: `<p>Every website lives at an IP address, and finding it is the first step to knowing who hosts a site, whether it's shared, or where it's located. Here's how.</p>
+      <h2>The quick way</h2>
+      <p>Look up the domain's <b>A record</b> (for IPv4) or <b>AAAA record</b> (for IPv6). <a href="/dns">HostCop's DNS lookup</a> shows both instantly, or <a href="/">a full report</a> gives you the IP plus who owns it.</p>
+      <h2>The command-line way</h2>
+      <p>On any computer you can run <code>nslookup example.com</code> or <code>dig example.com</code> to see the IP. It's the same data your browser uses to connect.</p>
+      <h2>The catch: it might be a CDN</h2>
+      <p>If a site uses Cloudflare, Akamai or Fastly, the IP you find belongs to the <b>CDN</b>, not the real server — the origin is deliberately hidden. So "the IP" may not tell you where the site actually runs. HostCop flags this and even tries to reveal the origin hiding behind the CDN.</p>
+      <h2>From IP to owner</h2>
+      <p>An IP alone isn't a name. To learn which company runs it, you trace it to its <b>ASN</b> (the network that owns the address block). <a href="/">HostCop does this automatically</a> and shows the provider — and <a href="/reverse-ip">reverse IP</a> reveals other sites sharing the same address.</p>
+      <h2>Why you'd want it</h2>
+      <p>Knowing the IP and its owner tells you the real host, roughly where the site is served from, and whether you're on crowded shared hosting or a dedicated setup.</p>`,
+  },
+  "what-is-an-ssl-certificate": {
+    title: "What is an SSL certificate, and why does your site need one?",
+    desc: "A plain-English explanation of SSL/TLS certificates, HTTPS, and what happens without one.",
+    date: "2026-07-06",
+    body: `<p>That padlock next to a website's address means it has a valid SSL certificate. Here's what that actually is and why every site needs one.</p>
+      <h2>What it does</h2>
+      <p>An SSL/TLS certificate does two jobs: it <b>encrypts</b> the connection so nobody between the visitor and the server can read the traffic, and it <b>proves</b> the site is really who it claims to be. Together, that's HTTPS.</p>
+      <h2>What happens without one</h2>
+      <p>Browsers mark HTTP sites as "Not secure," and any site handling logins or payments over plain HTTP is a serious risk. Google also uses HTTPS as a ranking signal, so there's an SEO cost too.</p>
+      <h2>Where certificates come from</h2>
+      <p>A Certificate Authority (CA) issues them after verifying you control the domain. <b>Let's Encrypt</b> issues them free and automatically — which is why HTTPS is now standard. Most hosts and CDNs (like Cloudflare) set this up for you.</p>
+      <h2>They expire</h2>
+      <p>Certificates are valid for a limited time (Let's Encrypt's last 90 days), so they must renew automatically. If auto-renewal breaks, the certificate lapses and every visitor hits a full-page security warning. That's the single most common avoidable outage.</p>
+      <h2>Check and watch yours</h2>
+      <p>HostCop's <a href="/ssl">SSL checker</a> reads any site's certificate — expiry date, issuer and validity — straight from the server. And <a href="/monitor">free monitoring</a> emails you when yours is within 14 days of expiring, so it never catches you out.</p>`,
+  },
+  "http-status-codes-explained": {
+    title: "HTTP status codes explained: 200, 301, 403, 404, 500",
+    desc: "What the common HTTP status codes mean in plain English — and what to do about each.",
+    date: "2026-07-06",
+    body: `<p>Every time a browser requests a page, the server answers with a three-digit status code. Knowing the common ones tells you instantly whether a site is fine, redirecting, blocking you, or broken.</p>
+      <h2>200 — OK</h2>
+      <p>Everything worked; the page loaded normally. Nothing to do.</p>
+      <h2>301 / 302 / 308 — Redirects</h2>
+      <p>The page has moved. <b>301</b> and <b>308</b> are permanent (use for HTTPS or www redirects); <b>302</b> is temporary. A few redirects are normal, but long chains slow the site and leak SEO value — check yours with the <a href="/redirect">redirect tool</a>.</p>
+      <h2>403 — Forbidden</h2>
+      <p>The server is up but refusing the request — often a bot-block. If you're a normal visitor seeing this, it may be a firewall rule. For automated checks, a 403 means the server is alive, not broken.</p>
+      <h2>404 — Not Found</h2>
+      <p>The page doesn't exist. On a random URL that's fine; on your <b>homepage</b> it usually means a misconfiguration.</p>
+      <h2>5xx — Server errors</h2>
+      <p><b>500</b> (internal error), <b>502</b> (bad gateway), <b>503</b> (unavailable) all mean the server itself is having problems right now — an app crash, an overloaded host, or maintenance. These are the ones to worry about.</p>
+      <h2>See a site's real status</h2>
+      <p>HostCop follows redirects to the final page and shows its true status code. Check whether a site is <a href="/down">up or down</a>, or run a <a href="/">full report</a> for the whole picture.</p>`,
+  },
+  "how-to-check-domain-age": {
+    title: "How to check a domain's age (and why it matters)",
+    desc: "Find out when a domain was registered, who registered it, and when it expires — and what age tells you.",
+    date: "2026-07-06",
+    body: `<p>A domain's age is a surprisingly useful signal — for trust, for SEO, and for spotting scams. Here's how to find it and what it means.</p>
+      <h2>What "domain age" means</h2>
+      <p>It's simply how long ago the domain was first registered. That date lives in the domain's public registration record, available through <b>WHOIS</b> or its modern replacement, <b>RDAP</b>.</p>
+      <h2>Why it matters</h2>
+      <p>An older domain usually signals an established, more trustworthy business. A domain registered days ago that's already asking for payments is a classic scam pattern. Age isn't proof of anything on its own, but it's a strong first filter.</p>
+      <h2>What else the record shows</h2>
+      <p>Alongside the registration date you get the <b>registrar</b> (who the domain was bought from), the <b>expiry date</b> (a soon-to-expire domain may be poorly maintained or about to change hands), and the <b>nameservers</b> (who runs its DNS).</p>
+      <h2>How to look it up</h2>
+      <p>HostCop's <a href="/whois">WHOIS &amp; domain age tool</a> pulls this straight from the official registry via RDAP and shows the age, registrar, and key dates in plain language — no cryptic raw WHOIS output.</p>
+      <h2>Pair it with the host</h2>
+      <p>Domain age plus hosting tells a fuller story. A brand-new domain on cheap shared hosting reads very differently from an eight-year-old domain on serious infrastructure. Run a <a href="/">full report</a> to see both at once.</p>`,
+  },
+  "what-is-a-website-built-with": {
+    title: "How to tell what a website is built with",
+    desc: "Detect the CMS, framework, server and tools behind any site — is it WordPress, Shopify, or something custom?",
+    date: "2026-07-06",
+    body: `<p>Whether you're sizing up a competitor, vetting an agency's work, or just curious, you can learn a lot about a website from the technology it runs on — usually without any inside access.</p>
+      <h2>What you can detect</h2>
+      <p>The <b>CMS or platform</b> (WordPress, Shopify, Wix, Webflow, Drupal), the <b>framework</b> (Next.js, React, Vue), the <b>web server</b> (nginx, Apache, LiteSpeed), the <b>analytics</b> (Google Analytics, Meta Pixel), and any <b>CDN</b> in front of it.</p>
+      <h2>How detection works</h2>
+      <p>Sites leave fingerprints: telltale file paths (<code>/wp-content/</code> screams WordPress), meta tags, cookie names, and HTTP headers. Detection tools scan the page's HTML and headers for these signatures — the same approach Wappalyzer uses.</p>
+      <h2>Why it's useful</h2>
+      <p>Pitching a redesign? Knowing a prospect runs an outdated WordPress tells you where to start. Choosing a platform? Seeing what sites you admire are built on is a shortcut. Researching competitors? Their stack hints at their budget and priorities.</p>
+      <h2>The limits</h2>
+      <p>Detection is best-effort. Custom-built or heavily proxied sites can hide their stack, and a blank result doesn't always mean nothing's there. It's a strong clue, not a guarantee.</p>
+      <h2>Try it</h2>
+      <p>HostCop's <a href="/tech">tech-stack detector</a> fingerprints any site's CMS, framework, server, analytics and CDN in seconds — and links straight to the <a href="/">full hosting report</a> so you also see who runs it and how fast it is.</p>`,
+  },
 };
 
 function pageGuidesIndex() {
