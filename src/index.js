@@ -47,6 +47,7 @@ export default {
       if (p === "/upgrade")      return handleUpgrade(request, env, url);
       if (p === "/pro/welcome")  return pageProWelcome(url);
       if (p === "/stripe/webhook") return handleStripeWebhook(request, env);
+      if (p === "/paypal/ipn")   return handlePaypalIpn(request, env);
       if (p === "/tools")        return pageTools();
       if (p === "/down" || p.startsWith("/down/"))       return toolDown(toolDomain(url, p, "/down"), env);
       if (p === "/ssl" || p.startsWith("/ssl/"))         return toolSsl(toolDomain(url, p, "/ssl"));
@@ -1191,7 +1192,8 @@ const PLANS = {
   free: { label: "Free", monitors: 3, freq: "every 30 min" },
   pro: { label: "Pro", monitors: 50, freq: "every 5 min" },
 };
-const PRO_PRICE = "$7";        // per month — change here + in Stripe
+const PRO_PRICE = "$7";        // per month — change here + in the PayPal button
+const PAYPAL_BUTTON_ID = "CN2Y4PBPAT9MU";   // hosted PayPal subscription button
 
 async function getPlan(env, email) {
   if (!email) return "free";
@@ -1263,17 +1265,49 @@ async function handleStripeWebhook(request, env) {
   return new Response("ok");
 }
 
+// PayPal IPN: PayPal POSTs subscription events here. We echo the payload back
+// to PayPal to confirm it's genuine, then upgrade/downgrade by the buyer's email
+// (the `custom` field we attached, falling back to their PayPal email).
+async function handlePaypalIpn(request, env) {
+  const body = await request.text();
+  let verified = false;
+  try {
+    const v = await fetch("https://ipnpb.paypal.com/cgi-bin/webscr", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", "user-agent": "HostCop-IPN/1.0" },
+      body: "cmd=_notify-validate&" + body,
+    });
+    verified = (await v.text()).trim() === "VERIFIED";
+  } catch { }
+  if (!verified) return new Response("ignored");   // don't act on unverified IPNs
+
+  const p = new URLSearchParams(body);
+  const email = (p.get("custom") || p.get("payer_email") || "").trim().toLowerCase();
+  const txn = p.get("txn_type") || "";
+  if (!email) return new Response("ok");
+  if (txn === "subscr_signup" || (txn === "subscr_payment" && (p.get("payment_status") || "") === "Completed")) {
+    await upsertSub(env, email, "pro", "active", p.get("payer_id"), p.get("subscr_id"));   // price is locked by the hosted button
+  } else if (["subscr_cancel", "subscr_eot", "subscr_failed"].includes(txn)) {
+    await env.DB.prepare("UPDATE subscriptions SET plan='free', status=?, updated=? WHERE email=?")
+      .bind(txn, Date.now(), email).run();
+  }
+  return new Response("ok");
+}
+
 function pagePricing(url, env) {
-  const soon = url.searchParams.get("soon"), bad = url.searchParams.get("bad"), err = url.searchParams.get("err");
-  const live = billingLive(env);
-  const notice = soon ? `<p class="note">Pro is launching very soon — <a href="/contact">tell us you're interested</a> and we'll let you know.</p>`
-    : bad ? `<p class="note">Please enter a valid email.</p>`
-    : err ? `<p class="note">Couldn't start checkout — please try again.</p>` : "";
-  const cta = live
-    ? `<form class="monitorform" action="/upgrade" method="post" style="margin-top:12px">
-         <input name="email" type="email" placeholder="you@email.com" required>
-         <button>Upgrade to Pro — ${PRO_PRICE}/mo</button></form>`
-    : `<a class="btn" href="/pricing?soon=1" style="margin-top:12px">Get notified when Pro launches</a>`;
+  const notice = "";
+  // PayPal subscription: the email they type becomes their Pro account (sent to
+  // PayPal as `custom`, echoed back to us on the IPN). Price is locked by the hosted button.
+  const cta = `<form class="paypalform" action="https://www.paypal.com/cgi-bin/webscr" method="post" target="_top">
+      <input type="hidden" name="cmd" value="_s-xclick">
+      <input type="hidden" name="hosted_button_id" value="${PAYPAL_BUTTON_ID}">
+      <input type="hidden" name="currency_code" value="USD">
+      <input type="hidden" name="notify_url" value="${BASE}/paypal/ipn">
+      <label>Your email <span class="muted">— this becomes your Pro account</span></label>
+      <input type="email" name="custom" placeholder="you@email.com" required>
+      <button type="submit">Subscribe with PayPal — ${PRO_PRICE}/mo</button>
+    </form>
+    <p class="muted small" style="margin-top:8px">Use the same email you monitor with, so Pro links to your account.</p>`;
   const feat = (ok, t) => `<div class="row"><span>${ok ? '<span class="up">✓</span>' : '<span class="muted">–</span>'} ${t}</span><b></b></div>`;
   return html(layout({
     title: "Pricing — free tools, Pro monitoring · HostCop",
@@ -2663,6 +2697,10 @@ select{padding:11px 12px;border:1px solid var(--border);border-radius:10px;backg
 .compareform{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:16px 0}
 .monitorform{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0;max-width:560px}
 .monitorform input{flex:1;min-width:180px}
+.paypalform{margin-top:12px}
+.paypalform label{display:block;font-size:.82rem;color:var(--fg);margin-bottom:5px}
+.paypalform input[type=email]{width:100%;margin-bottom:10px}
+.paypalform button{width:100%}
 .toolform{display:flex;gap:8px;margin:16px 0;max-width:480px}
 .toolform input{flex:1;min-width:0}
 .toolgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:18px 0}
