@@ -1194,7 +1194,7 @@ const PLANS = {
 };
 const PRO_PRICE = "$7";        // per month — change here + in the PayPal button
 const PAYPAL_BUTTON_ID = "CN2Y4PBPAT9MU";   // hosted PayPal subscription button (live)
-const PAYPAL_SANDBOX_BUSINESS = "";         // sandbox business email — set to test at /pricing?sandbox=1
+const PAYPAL_SANDBOX_BUSINESS = "sb-g9zly51983264@business.example.com";  // sandbox merchant — test at /pricing?sandbox=1
 
 async function getPlan(env, email) {
   if (!email) return "free";
