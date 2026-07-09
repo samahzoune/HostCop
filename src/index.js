@@ -2512,7 +2512,10 @@ ${ld}
     <a href="/monitor">Monitor</a>
     <a href="/pricing">Pricing</a>
     <a href="/about">About</a>
-    <button class="themebtn" onclick="hcToggle()" aria-label="Toggle dark mode" title="Toggle theme">◐</button>
+    <button class="themebtn" onclick="hcToggle()" aria-label="Toggle dark mode" title="Toggle theme">
+      <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      <svg class="moon" viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+    </button>
   </nav>
 </div></header>
 <main${home ? ' class="wide"' : ""}>${body}</main>
@@ -2573,8 +2576,11 @@ main.wide{max-width:980px}
 .livepill{display:inline-flex;align-items:center;gap:6px;font-size:.64rem;letter-spacing:.14em;color:var(--up);border:1px solid var(--border);border-radius:999px;padding:3px 9px}
 .livedot{width:7px;height:7px;border-radius:50%;background:var(--up);flex:none;animation:pulse 1.9s infinite}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.55)}70%{box-shadow:0 0 0 7px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
-.themebtn{background:none;border:1px solid var(--border);border-radius:8px;color:var(--muted);width:34px;height:34px;cursor:pointer;font-size:16px}
+.themebtn{display:inline-flex;align-items:center;justify-content:center;background:none;border:1px solid var(--border);border-radius:8px;color:var(--muted);width:34px;height:34px;cursor:pointer;padding:0}
 .themebtn:hover{color:var(--fg);border-color:var(--brand)}
+.themebtn svg{width:17px;height:17px}
+.themebtn .moon{display:none}.themebtn .sun{display:block}
+[data-theme=light] .themebtn .sun{display:none}[data-theme=light] .themebtn .moon{display:block}
 .hero{display:grid;grid-template-columns:1.15fr .85fr;gap:36px;align-items:center;padding:46px 0 28px}
 .hero-copy h1{font-size:3rem}
 .hl{color:var(--brand);position:relative;white-space:nowrap}
