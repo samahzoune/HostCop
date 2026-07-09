@@ -1364,7 +1364,7 @@ function pagePricing(url, env) {
           ${feat(true, "Checked every 30 min")}
           ${feat(true, "Downtime & SSL email alerts")}
           ${feat(false, "5-minute checks")}
-          <a class="btn ghost" href="/monitor" style="margin-top:12px">Start monitoring free</a>
+          <a class="btn ghost" href="/monitor" style="display:block;text-align:center;margin-top:12px">Start monitoring free</a>
         </div>
         <div class="col" style="border-color:var(--brand)">
           <h3>Pro <span class="tag">popular</span></h3>
