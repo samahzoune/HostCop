@@ -1193,7 +1193,8 @@ const PLANS = {
   pro: { label: "Pro", monitors: 50, freq: "every 5 min" },
 };
 const PRO_PRICE = "$7";        // per month — change here + in the PayPal button
-const PAYPAL_BUTTON_ID = "CN2Y4PBPAT9MU";   // hosted PayPal subscription button
+const PAYPAL_BUTTON_ID = "CN2Y4PBPAT9MU";   // hosted PayPal subscription button (live)
+const PAYPAL_SANDBOX_BUSINESS = "";         // sandbox business email — set to test at /pricing?sandbox=1
 
 async function getPlan(env, email) {
   if (!email) return "free";
@@ -1270,9 +1271,14 @@ async function handleStripeWebhook(request, env) {
 // (the `custom` field we attached, falling back to their PayPal email).
 async function handlePaypalIpn(request, env) {
   const body = await request.text();
+  const p = new URLSearchParams(body);
+  // Sandbox IPNs carry test_ipn=1 and must be validated against the sandbox server.
+  const verifyUrl = p.get("test_ipn") === "1"
+    ? "https://ipnpb.sandbox.paypal.com/cgi-bin/webscr"
+    : "https://ipnpb.paypal.com/cgi-bin/webscr";
   let verified = false;
   try {
-    const v = await fetch("https://ipnpb.paypal.com/cgi-bin/webscr", {
+    const v = await fetch(verifyUrl, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", "user-agent": "HostCop-IPN/1.0" },
       body: "cmd=_notify-validate&" + body,
@@ -1281,7 +1287,6 @@ async function handlePaypalIpn(request, env) {
   } catch { }
   if (!verified) return new Response("ignored");   // don't act on unverified IPNs
 
-  const p = new URLSearchParams(body);
   const email = (p.get("custom") || p.get("payer_email") || "").trim().toLowerCase();
   const txn = p.get("txn_type") || "";
   if (!email) return new Response("ok");
@@ -1296,9 +1301,31 @@ async function handlePaypalIpn(request, env) {
 
 function pagePricing(url, env) {
   const notice = "";
+  const sandbox = url.searchParams.get("sandbox") === "1";
   // PayPal subscription: the email they type becomes their Pro account (sent to
-  // PayPal as `custom`, echoed back to us on the IPN). Price is locked by the hosted button.
-  const cta = `<form class="paypalform" action="https://www.paypal.com/cgi-bin/webscr" method="post" target="_top">
+  // PayPal as `custom`, echoed back to us on the IPN). Price is locked server-side.
+  let cta;
+  if (sandbox && PAYPAL_SANDBOX_BUSINESS) {
+    // Test flow — non-hosted sandbox subscription (fake money). Same IPN handler.
+    cta = `<p class="note">🧪 Sandbox test mode — no real money. Pay with your PayPal <b>sandbox personal</b> account.</p>
+    <form class="paypalform" action="https://www.sandbox.paypal.com/cgi-bin/webscr" method="post" target="_top">
+      <input type="hidden" name="cmd" value="_xclick-subscriptions">
+      <input type="hidden" name="business" value="${esc(PAYPAL_SANDBOX_BUSINESS)}">
+      <input type="hidden" name="item_name" value="HostCop Pro (Sandbox)">
+      <input type="hidden" name="a3" value="7.00">
+      <input type="hidden" name="p3" value="1">
+      <input type="hidden" name="t3" value="M">
+      <input type="hidden" name="src" value="1">
+      <input type="hidden" name="currency_code" value="USD">
+      <input type="hidden" name="notify_url" value="${BASE}/paypal/ipn">
+      <label>Your email <span class="muted">— this becomes your Pro account</span></label>
+      <input type="email" name="custom" placeholder="you@email.com" required>
+      <button type="submit">Subscribe (sandbox test)</button>
+    </form>`;
+  } else if (sandbox) {
+    cta = `<p class="note">Sandbox isn't configured yet — send me your PayPal sandbox business email and I'll switch it on.</p>`;
+  } else {
+    cta = `<form class="paypalform" action="https://www.paypal.com/cgi-bin/webscr" method="post" target="_top">
       <input type="hidden" name="cmd" value="_s-xclick">
       <input type="hidden" name="hosted_button_id" value="${PAYPAL_BUTTON_ID}">
       <input type="hidden" name="currency_code" value="USD">
@@ -1308,6 +1335,7 @@ function pagePricing(url, env) {
       <button type="submit">Subscribe with PayPal — ${PRO_PRICE}/mo</button>
     </form>
     <p class="muted small" style="margin-top:8px">Use the same email you monitor with, so Pro links to your account.</p>`;
+  }
   const feat = (ok, t) => `<div class="row"><span>${ok ? '<span class="up">✓</span>' : '<span class="muted">–</span>'} ${t}</span><b></b></div>`;
   return html(layout({
     title: "Pricing — free tools, Pro monitoring · HostCop",
