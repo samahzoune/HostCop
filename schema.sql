@@ -54,3 +54,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   updated         INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_subs_customer ON subscriptions(stripe_customer);
+
+-- Pro waitlist — people to email when paid billing goes live.
+CREATE TABLE IF NOT EXISTS waitlist (
+  email      TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL
+);

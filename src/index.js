@@ -46,6 +46,7 @@ export default {
       if (p === "/pricing")      return pagePricing(url, env);
       if (p === "/upgrade")      return handleUpgrade(request, env, url);
       if (p === "/pro/welcome")  return pageProWelcome(url);
+      if (p === "/waitlist")     return request.method === "POST" ? handleWaitlist(request, env) : Response.redirect(BASE + "/pricing", 303);
       if (p === "/stripe/webhook") return handleStripeWebhook(request, env);
       if (p === "/paypal/ipn")   return handlePaypalIpn(request, env);
       if (p === "/tools")        return pageTools();
@@ -1298,20 +1299,27 @@ async function handlePaypalIpn(request, env) {
   return new Response("ok");
 }
 
+async function handleWaitlist(request, env) {
+  const form = await request.formData();
+  const email = cleanEmail(form.get("email") || "");
+  if (!email) return html(layout({ title: "Waitlist · HostCop", desc: "", path: "/pricing",
+    body: `<h1>Join the Pro waitlist</h1><p class="note">Please enter a valid email.</p><p><a href="/pricing">← back to pricing</a></p>` }), 400);
+  await env.DB.prepare("INSERT OR IGNORE INTO waitlist (email, created_at) VALUES (?,?)").bind(email, Date.now()).run();
+  return html(layout({ title: "You're on the list · HostCop", desc: "", path: "/pricing",
+    body: `<div class="verdict ok">You're on the Pro waitlist. 🎉</div>
+      <p>Thanks — we'll email <b>${esc(email)}</b> the moment Pro launches (50 monitored sites, 5-minute checks).</p>
+      <p class="muted">Everything else stays free: <a href="/tools">use the tools</a> or <a href="/monitor">monitor a site free</a>.</p>` }));
+}
+
 function pagePricing(url, env) {
   const notice = "";
-  // PayPal subscription: the email they type becomes their Pro account (sent to
-  // PayPal as `custom`, echoed back on the IPN). Price is locked by the hosted button.
-  const cta = `<form class="paypalform" action="https://www.paypal.com/cgi-bin/webscr" method="post" target="_top">
-      <input type="hidden" name="cmd" value="_s-xclick">
-      <input type="hidden" name="hosted_button_id" value="${PAYPAL_BUTTON_ID}">
-      <input type="hidden" name="currency_code" value="USD">
-      <input type="hidden" name="notify_url" value="${BASE}/paypal/ipn">
-      <label>Your email <span class="muted">— this becomes your Pro account</span></label>
-      <input type="email" name="custom" placeholder="you@email.com" required>
-      <button type="submit">Subscribe with PayPal — ${PRO_PRICE}/mo</button>
+  // Pro billing isn't live yet (payment processor pending) — collect a waitlist.
+  const cta = `<form class="paypalform" action="/waitlist" method="post">
+      <label>Your email <span class="muted">— we'll tell you when Pro launches</span></label>
+      <input type="email" name="email" placeholder="you@email.com" required>
+      <button type="submit">Join the Pro waitlist</button>
     </form>
-    <p class="muted small" style="margin-top:8px">Use the same email you monitor with, so Pro links to your account.</p>`;
+    <p class="muted small" style="margin-top:8px">Pro isn't live yet — no charge now. We'll email you the moment it opens.</p>`;
   const feat = (ok, t) => `<div class="row"><span>${ok ? '<span class="up">✓</span>' : '<span class="muted">–</span>'} ${t}</span><b></b></div>`;
   return html(layout({
     title: "Pricing — free tools, Pro monitoring · HostCop",
@@ -1344,7 +1352,7 @@ function pagePricing(url, env) {
         </div>
         <div class="col" style="border-color:var(--brand)">
           <h3>Pro <span class="tag">popular</span></h3>
-          <p class="muted small" style="text-align:center;margin:0 0 8px">${PRO_PRICE}/month</p>
+          <p class="muted small" style="text-align:center;margin:0 0 8px">${PRO_PRICE}/month · <b>coming soon</b></p>
           ${feat(true, "Everything in Free")}
           ${feat(true, `Monitor ${PLANS.pro.monitors} sites`)}
           ${feat(true, "Checked every 5 min")}
