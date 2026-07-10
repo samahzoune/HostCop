@@ -16,9 +16,13 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Canonical host: www -> apex (SSL + one canonical URL everywhere)
-    if (url.hostname.startsWith("www.")) {
-      url.hostname = url.hostname.slice(4);
+    // Force HTTPS + canonical apex host (www -> apex) in a single 301.
+    // cf-visitor carries the real client scheme; url.protocol is the fallback.
+    const cfv = request.headers.get("cf-visitor") || "";
+    const isHttp = cfv ? cfv.includes('"scheme":"http"') : url.protocol === "http:";
+    if (isHttp || url.hostname.startsWith("www.")) {
+      url.protocol = "https:";
+      url.hostname = url.hostname.replace(/^www\./, "");
       return Response.redirect(url.toString(), 301);
     }
 
