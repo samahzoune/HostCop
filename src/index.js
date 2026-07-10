@@ -1138,6 +1138,15 @@ async function handleMonitorUnsub(url, env) {
     body: `<h1>Unsubscribed</h1><p>${m ? `You'll no longer get alerts for <b>${esc(m.domain)}</b>.` : "That link is no longer valid."}</p>` }));
 }
 
+// Does this domain have at least one active Pro subscriber? (gates multi-region.)
+async function domainIsPro(env, domain) {
+  const r = await env.DB.prepare(
+    `SELECT 1 FROM monitors m WHERE m.domain=? AND m.verified=1 AND EXISTS
+     (SELECT 1 FROM subscriptions s WHERE s.email=m.email AND s.plan='pro' AND s.status='active') LIMIT 1`
+  ).bind(domain).first();
+  return !!r;
+}
+
 // Cron worker: check each monitored domain, email on up/down transitions + SSL expiry.
 async function runMonitors(env, scope = "all") {
   const proOnly = `SELECT DISTINCT m.domain FROM monitors m WHERE m.verified=1 AND EXISTS
@@ -1148,10 +1157,11 @@ async function runMonitors(env, scope = "all") {
     let res = await runCheck(domain, "monitor", env);
     if (!res) continue;
     let isUp = res.noDns ? false : !!res.up;
-    if (!isUp && !res.noDns) {                      // confirm down from multiple regions before alerting
-      const regions = await probeRegions(`https://${domain}/`, env);
-      if (regions) isUp = regions.some(r => r.up);   // reachable from ANY region → not a real outage
-      else { const res2 = await runCheck(domain, "monitor", env); if (res2) { res = res2; isUp = !res2.noDns && !!res2.up; } }
+    if (!isUp && !res.noDns) {                      // confirm before alerting
+      const pro = scope === "pro" || await domainIsPro(env, domain);
+      const regions = pro ? await probeRegions(`https://${domain}/`, env) : null;
+      if (regions) isUp = regions.some(r => r.up);   // Pro: reachable from ANY of 5 regions → not down
+      else { const res2 = await runCheck(domain, "monitor", env); if (res2) { res = res2; isUp = !res2.noDns && !!res2.up; } }  // Free: single-region retry
     }
     const cur = isUp ? "up" : "down";
     const { results: subs } = await env.DB.prepare(
@@ -1354,10 +1364,9 @@ function pagePricing(url, env) {
           <h3>Pro <span class="tag">popular</span></h3>
           <p class="muted small" style="text-align:center;margin:0 0 8px">${PRO_PRICE}/month · <b>coming soon</b></p>
           ${feat(true, "Everything in Free")}
-          ${feat(true, `Monitor ${PLANS.pro.monitors} sites`)}
-          ${feat(true, "Checked every 5 min")}
-          ${feat(true, "Multi-region downtime checks")}
-          ${feat(true, "Priority email alerts")}
+          ${feat(true, `Monitor ${PLANS.pro.monitors} sites (vs 3)`)}
+          ${feat(true, "Checked every 5 min (vs 30)")}
+          ${feat(true, "Downtime confirmed across 5 regions")}
           ${feat(true, "Support an independent, unbiased watchdog")}
           ${cta}
         </div>
