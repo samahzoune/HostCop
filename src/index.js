@@ -2015,8 +2015,8 @@ async function handleHome(env) {
     </section>
   `;
   return html(layout({
-    title: "HostCop — who really hosts any website? Neutral, measured, no fake reviews",
-    desc: "Paste a domain and HostCop detects the real hosting provider behind CDNs and resellers, then measures response time, uptime and SSL expiry live. Neutral host rankings from crowdsourced data — no reviews, no affiliate bias.",
+    title: "HostCop — Who Really Hosts Any Website?",
+    desc: "Paste a domain and HostCop reveals the real host behind CDNs and resellers, then measures response time, uptime and SSL live — no fake reviews, no bias.",
     path: "/", body, home: true,
     jsonld: [{
       "@context": "https://schema.org", "@type": "WebSite", name: "HostCop", url: BASE + "/",
@@ -2551,6 +2551,7 @@ function layout({ title, desc, path, body, home, jsonld }) {
 <meta name="twitter:description" content="${esc(d)}">
 <meta name="twitter:image" content="${BASE}/og.svg">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
